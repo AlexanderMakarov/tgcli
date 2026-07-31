@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `mcp-server.js`: MCP HTTP server built with `@modelcontextprotocol/sdk`, registering the Telegram tools (`listChannels`, `searchChannels`, `getChannelMessages`, `scheduleMessageSync`, `listMessageSyncJobs`, `messagesListMyReacted`).
+- `mcp-server.js`: MCP HTTP server built with `@modelcontextprotocol/sdk`, registering the Telegram tools (`listChannels`, `searchChannels`, `getChannelMessages`, `scheduleMessageSync`, `listMessageSyncJobs`).
 - `telegram-client.js`: Domain logic for MTProto login, dialog traversal, and message helpers.
 - `client.js`: Example CLI harness for manual testing without the MCP layer.
 - `message-sync-service.js`: Background worker that archives messages into a local SQLite database.

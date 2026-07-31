@@ -26,16 +26,6 @@ const resolvedHost = mcpConfig.host ?? process.env.MCP_HOST ?? process.env.FASTM
 const resolvedPort = Number(mcpConfig.port ?? process.env.MCP_PORT ?? process.env.FASTMCP_PORT ?? "8080");
 const HOST = resolvedHost;
 const PORT = Number.isFinite(resolvedPort) && resolvedPort > 0 ? resolvedPort : 8080;
-
-// Bearer-token auth — gated by kbbuilder (the only caller). No token = dev passthrough.
-const KB_TOKEN = mcpConfig.auth?.kbToken ?? process.env.TGCLI_KB_TOKEN ?? null;
-const AUTH_ENABLED = Boolean(KB_TOKEN);
-function isAuthorized(req) {
-  if (!AUTH_ENABLED) return true;
-  const auth = req.headers["authorization"] ?? "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
-  return token === KB_TOKEN;
-}
 const { telegramClient, messageSyncService } = createServices({ storeDir, config });
 
 let telegramReady = false;
@@ -378,30 +368,6 @@ const messagesSearchSchema = {
     .boolean({ invalid_type_error: "caseInsensitive must be a boolean" })
     .optional()
     .describe("Whether regex matching should be case-insensitive (default: true)"),
-};
-
-const messagesListMyReactedSchema = {
-  fromDate: z
-    .string({ invalid_type_error: "fromDate must be a string" })
-    .min(1)
-    .optional()
-    .describe(
-      "Earliest ISO-8601 message date to include (optional). Filters the MESSAGE's date, not when the reaction was added — Telegram exposes no global \"reacted since\" index.",
-    ),
-  toDate: z
-    .string({ invalid_type_error: "toDate must be a string" })
-    .min(1)
-    .optional()
-    .describe("Latest ISO-8601 message date to include (optional)"),
-  emoji: z
-    .string({ invalid_type_error: "emoji must be a string" })
-    .min(1)
-    .optional()
-    .describe("Unicode reaction emoji to match (default: \uD83D\uDC4D)"),
-  limit: z.number().int().positive().optional().describe("Maximum number of matching messages to return (default: 50)"),
-  channelId: channelIdSchema
-    .optional()
-    .describe("Optional numeric channel ID or username to restrict the scan to a single dialog"),
 };
 
 const messagesSendSchema = {
@@ -1291,63 +1257,6 @@ function createServerInstance() {
   );
 
   server.tool(
-    "messagesListMyReacted",
-    "Scans LIVE Telegram (mtcute, not the SQLite archive) for messages the current user has reacted to. " +
-      "Enumerates dialogs and walks each one's history newest-first, stopping a dialog's scan once a message's " +
-      "date falls before fromDate. IMPORTANT: fromDate/toDate filter the MESSAGE's date, not when the reaction " +
-      "was added — Telegram exposes no global \"reacted since\" index, so a reaction added today on a message " +
-      "from last year will only surface if fromDate allows that old date. When channelId is omitted, at most " +
-      "200 dialogs are scanned (oldest/newest-sorted by Telegram's dialog order, not further filterable here); " +
-      "set channelId to scan a single dialog exhaustively instead. Reactions minimized by Telegram " +
-      "(reactions.raw.min) are refreshed via getMessageReactions before matching.",
-    messagesListMyReactedSchema,
-    async ({ fromDate, toDate, emoji, channelId, limit }) => {
-      await telegramClient.ensureLogin();
-      const fromMs = parseDateMs(fromDate, "fromDate");
-      const toMs = parseDateMs(toDate, "toDate");
-      const finalLimit = limit ?? 50;
-      const resolvedEmoji = emoji && emoji.trim() ? emoji.trim() : "\uD83D\uDC4D";
-
-      const raw = await telegramClient.listMyReactedMessages({
-        fromDate: fromMs,
-        toDate: toMs,
-        emoji: resolvedEmoji,
-        limit: finalLimit,
-        channelId: channelId ?? null,
-      });
-
-      const messages = raw.messages.map((message) => ({
-        ...formatLiveMessage(message, {
-          channelId: message.peer_id,
-          peerTitle: message.peerTitle,
-          username: message.username,
-        }),
-        reactionEmoji: message.reactionEmoji,
-        hasMedia: message.hasMedia,
-        mediaKind: message.mediaKind,
-        source: "live",
-      }));
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                source: "live",
-                returned: messages.length,
-                messages,
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
-    },
-  );
-
-  server.tool(
     "messagesSend",
     "Sends a text message to a channel or chat.",
     messagesSendSchema,
@@ -2021,12 +1930,6 @@ if (mcpEnabled) {
 
       if (req.method === "OPTIONS") {
         res.writeHead(204).end();
-        return;
-      }
-
-      if (!isAuthorized(req)) {
-        res.writeHead(401, { "WWW-Authenticate": "Bearer", "Content-Type": "application/json" })
-          .end(JSON.stringify({ error: "Unauthorized" }));
         return;
       }
 
