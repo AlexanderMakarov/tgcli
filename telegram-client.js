@@ -363,6 +363,21 @@ export function normalizeChannelId(channelId) {
   throw new Error('Invalid channel ID provided');
 }
 
+function toEpochSeconds(value) {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) {
+    return Math.floor(value.getTime() / 1000);
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.floor(value / 1000);
+  }
+  return null;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 class TelegramClient {
   constructor(apiId, apiHash, phoneNumber, sessionPath = DEFAULT_SESSION_PATH, options = {}) {
     this.apiId = coerceApiId(apiId);
@@ -774,6 +789,146 @@ class TelegramClient {
       total: results.total ?? messages.length,
       next: results.next ?? null,
       messages,
+    };
+  }
+
+  /**
+   * Scans LIVE Telegram (via mtcute, not the SQLite archive) for messages the
+   * current user has reacted to. Telegram has no global "reacted since" index,
+   * so this enumerates dialogs and walks each one's history (newest-first via
+   * `iterHistory`), inspecting `Message.reactions` for a `ReactionCount` whose
+   * `order` (chosen_order) is set and whose emoji matches. Per-dialog scanning
+   * stops as soon as a message's date falls before `fromDate`, since history
+   * is returned newest-first. `fromDate`/`toDate` bound the *message* date,
+   * not when the reaction was added (Telegram doesn't expose that globally).
+   *
+   * Reactions can arrive "minimized" (`reactions.raw.min`) on messages not
+   * authored by the current user, meaning the current user's own reaction
+   * order isn't included. Those are refreshed via `getMessageReactions`
+   * before evaluating the match, since `_serializeMessage` (called after)
+   * discards the raw reactions data.
+   *
+   * @param {object} [options]
+   * @param {number|Date|null} [options.fromDate] Earliest message date to scan (ms epoch or Date)
+   * @param {number|Date|null} [options.toDate] Latest message date to scan (ms epoch or Date)
+   * @param {string} [options.emoji] Unicode emoji to match (default 👍)
+   * @param {number} [options.limit] Max matching messages to return (default 50)
+   * @param {string|number|null} [options.channelId] Restrict to a single dialog
+   * @param {number} [options.maxDialogs] Cap on dialogs scanned when channelId is omitted (default 200)
+   * @param {number} [options.dialogDelayMs] Delay between dialogs to reduce FLOOD_WAIT risk (default 150ms)
+   * @param {number} [options.maxMessagesPerDialog] Safety cap on messages walked per dialog (default 5000)
+   */
+  async listMyReactedMessages(options = {}) {
+    await this.ensureLogin();
+
+    const {
+      fromDate = null,
+      toDate = null,
+      emoji = '👍',
+      limit = 50,
+      channelId = null,
+      maxDialogs = 200,
+      dialogDelayMs = 150,
+      maxMessagesPerDialog = 5000,
+    } = options;
+
+    const fromSeconds = toEpochSeconds(fromDate);
+    const toSeconds = toEpochSeconds(toDate);
+    const effectiveLimit = Number.isFinite(limit) && limit > 0 ? Number(limit) : 50;
+    const hasChannelFilter = channelId !== null && channelId !== undefined && String(channelId).trim() !== '';
+
+    const dialogs = [];
+    if (hasChannelFilter) {
+      const peerRef = normalizeChannelId(channelId);
+      const peer = await this.client.resolvePeer(peerRef);
+      dialogs.push(peer);
+    } else {
+      for await (const dialog of this.client.iterDialogs({})) {
+        if (!dialog.peer) continue;
+        dialogs.push(dialog.peer);
+        if (dialogs.length >= maxDialogs) break;
+      }
+    }
+
+    const results = [];
+    let dialogsScanned = 0;
+
+    for (const peer of dialogs) {
+      if (results.length >= effectiveLimit) break;
+      dialogsScanned += 1;
+
+      const iterOptions = { chunkSize: 100 };
+      if (toSeconds !== null) {
+        iterOptions.offset = { date: toSeconds, id: 0 };
+      }
+
+      let scannedInDialog = 0;
+      try {
+        for await (const message of this.client.iterHistory(peer, iterOptions)) {
+          scannedInDialog += 1;
+          if (scannedInDialog > maxMessagesPerDialog) {
+            break;
+          }
+
+          const dateSeconds = toEpochSeconds(message.date);
+          if (fromSeconds !== null && dateSeconds !== null && dateSeconds < fromSeconds) {
+            // History is newest-first: every remaining message in this dialog is older still.
+            break;
+          }
+          if (toSeconds !== null && dateSeconds !== null && dateSeconds > toSeconds) {
+            continue;
+          }
+
+          let reactions = message.reactions ?? null;
+          if (reactions && reactions.raw?.min) {
+            try {
+              const [refreshed] = await this.client.getMessageReactions([message]);
+              if (refreshed) {
+                reactions = refreshed;
+              }
+            } catch (error) {
+              console.warn(
+                `[warning] failed to refresh minimized reactions for message ${message.id} in dialog ${peer?.id}:`,
+                error?.message || error,
+              );
+            }
+          }
+
+          if (!reactions) continue;
+
+          const chosen = reactions.reactions.find((rc) => rc.order != null && rc.emoji === emoji);
+          if (!chosen) continue;
+
+          const serialized = this._serializeMessage(message, peer);
+          results.push({
+            ...serialized,
+            reactionEmoji: emoji,
+            hasMedia: Boolean(serialized.media),
+            mediaKind: serialized.media?.type ?? null,
+            peerTitle: peer?.displayName || 'Unknown',
+            username: 'username' in peer && peer.username ? peer.username : null,
+          });
+
+          if (results.length >= effectiveLimit) break;
+        }
+      } catch (error) {
+        console.warn(
+          `[warning] failed to scan dialog ${peer?.id ?? 'unknown'} for reactions:`,
+          error?.message || error,
+        );
+      }
+
+      const hasMoreDialogs = dialogsScanned < dialogs.length;
+      if (dialogDelayMs > 0 && hasMoreDialogs && results.length < effectiveLimit) {
+        await sleep(dialogDelayMs);
+      }
+    }
+
+    return {
+      messages: results.slice(0, effectiveLimit),
+      dialogsScanned,
+      dialogsAvailable: dialogs.length,
+      dialogsCapped: !hasChannelFilter && dialogs.length >= maxDialogs,
     };
   }
 

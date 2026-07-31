@@ -126,6 +126,15 @@ This document defines the consolidated MCP tool surface. The goal is fewer tools
   - caseInsensitive? (boolean, default true)
 - Output: list of messages + match/snippet when available.
 
+### messagesListMyReacted
+- Purpose: find messages the current user has reacted to, for reaction-driven wiki ingest (kbbuilder tgcli#1). Queries LIVE Telegram via mtcute — **never** the SQLite archive, which only covers a subset of channels.
+- Params: fromDate? (ISO), toDate? (ISO), emoji? (default 👍, unicode string), limit? (default 50), channelId? (optional — restrict to a single dialog).
+- Output: { source: "live", returned, messages }, where each message matches the `messagesList` live-source shape (`formatLiveMessage`) plus reactionEmoji, hasMedia (boolean), mediaKind (`media.type` or null), source: "live".
+- **fromDate/toDate filter the MESSAGE's date, not when the reaction was added** — Telegram exposes no global "reacted since" index. A reaction added today on a message from six months ago will only surface if fromDate allows that older date.
+- Mechanics: enumerates dialogs with `iterDialogs`, then walks each dialog's history newest-first with `iterHistory`, stopping that dialog's scan as soon as a message's date falls before `fromDate`. A message counts as "reacted" when its `reactions` include a `ReactionCount` with a non-null `order` (chosen_order) and a matching emoji. Reactions minimized by Telegram (`reactions.raw.min`, common on messages not authored by the current user) are refreshed via `getMessageReactions` before matching, since minimized entries omit the current user's own reaction order.
+- Bounds: stops once `limit` matches are found; when `channelId` is omitted, scans at most 200 dialogs (oldest dialogs beyond that cutoff are not scanned — pass `channelId` to scan a specific dialog exhaustively instead); applies a small delay between dialogs to reduce `FLOOD_WAIT` risk; caps per-dialog history walking at 5000 messages as a safety net when no `fromDate` is given.
+- Out of scope: does not index reactions from live updates (`onUpdate`) — this is a pull-scan-only tool, not a persistent reaction index.
+
 ### messagesSend
 - Params: channelId (required), text (required), topicId?, replyToMessageId?
 - Output: { messageId }.
