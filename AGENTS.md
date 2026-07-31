@@ -30,10 +30,12 @@
 ## Commit & Pull Request Guidelines
 - Follow Conventional Commits (`type: subject`) as seen in `docs(readme): add detailed login guide...`; use lowercase types for routine changes and `fix:` for bug patches.
 - Keep commits atomic; include body details when altering session management or cache persistence.
+- **Deliver all code changes via pull requests** — never push commits directly to `main` on `AlexanderMakarov/tgcli` (or to upstream). Work on a feature branch, open a PR into `main`, and merge only after review (or explicit owner approval).
+- Prefer the fork remote (`git@github.com:AlexanderMakarov/tgcli.git`) for branches/PRs; do not push feature work to `kfastov/tgcli` unless opening an upstream contribution PR.
 - PR descriptions should summarize intent, list manual verification (commands run, Telegram scenarios exercised), link related issues, and attach console excerpts when tool output changes.
 - Confirm no sensitive credentials or runtime artifacts from the tgcli store are committed before requesting review.
 
 ## Workflow
 - On startup, read `backlog.md` and pull tasks from it.
 - Thoroughly verify implemented functionality (tests, smoke runs, manual checks).
-- Commit verified features before starting the next task.
+- Commit verified features on a branch and open a PR before starting the next task (see Commit & Pull Request Guidelines).
