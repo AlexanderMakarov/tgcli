@@ -57,13 +57,30 @@ tgcli send file --to @channel --file ./report.pdf --caption "FYI"
 tgcli send text --to @username --message "Hello"
 ```
 
-### Sync & Service
+### Backfill & Service
 ```bash
-tgcli sync --follow
-tgcli sync jobs add --chat @channel --min-date 2024-01-01T00:00:00Z
+tgcli backfill --chat @channel                 # backfill one chat (auto-starts the server, follows progress)
+tgcli backfill --chat @channel --background    # enqueue and return the job id
+tgcli backfill --chat @channel --depth 5000 --min-date 2024-01-01T00:00:00Z
+tgcli backfill status                          # active backfills + server status
+tgcli backfill count                           # number of in-progress backfills
+tgcli backfill wait                            # block until the queue drains
+tgcli backfill cancel --chat @channel          # stop a chat's backfills
+tgcli channels watch --chat @channel           # subscribe a chat for archiving (queues a backfill)
+tgcli channels unwatch --chat @channel         # stop archiving a chat
+tgcli backfill --follow                         # track the server's queue to completion (`sync` is a silent alias)
 tgcli service install
 tgcli service start
 ```
+
+Telegram and archive commands (channels, messages, send, media, topics, tags,
+metadata, contacts, groups, folders) run through the always-on control server,
+not the CLI. The CLI is a thin client: it auto-starts `tgcli server` in the
+background when one isn't running, has it execute the operation against its warm
+connection and database, then renders the result; the server shuts itself down
+once idle. `config`, `service`, `doctor`, and `auth` stay local. Foreground
+`backfill --chat` follows progress on stderr; **Ctrl-C detaches** (the job keeps
+running — check `tgcli backfill status`).
 
 ### Contacts & Groups
 ```bash
@@ -84,3 +101,5 @@ tgcli channels list --limit 10 --json
 
 - Use `--source live|archive|both` when listing or searching messages.
 - `--json` is best for AI/tooling pipelines.
+- `send` commands time out after `30s` by default so they never hang on a stuck connection. Override with `--timeout 5m` or disable with `--timeout 0`. Long-running commands (`backfill`, `--follow`, `server`) are unbounded by default.
+- `backfill` is the canonical archive command; `sync` (and `channels sync --enable/--disable`) keep working as aliases. Prefer `channels watch`/`channels unwatch` to subscribe/unsubscribe a chat.

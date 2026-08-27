@@ -545,6 +545,10 @@ export default class MessageSyncService {
     this.realtimeActive = false;
     this.realtimeHandlers = null;
     this.unsubscribeChannelTooLong = null;
+    // Id of the job this instance set to `in_progress` while running the queue.
+    // Only the queue worker owns its in-flight job; `shutdown()` requeues just
+    // this one so it resumes next run, without touching jobs other processes own.
+    this.ownedInProgressJobId = null;
 
     this._initDatabase();
   }
@@ -630,6 +634,7 @@ export default class MessageSyncService {
     this._ensureJobColumn('cursor_message_id', 'INTEGER');
     this._ensureJobColumn('cursor_message_date', 'TEXT');
     this._ensureJobColumn('backfill_min_date', 'TEXT');
+    this._ensureJobColumn('started_at', 'TEXT');
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS users (
@@ -1971,6 +1976,25 @@ export default class MessageSyncService {
     return { canceled: ids.length, jobIds: ids };
   }
 
+  // Compact `{ pending, inProgress }` snapshot for the control API
+  // (`/control/ping`) and the idle monitor. A trivial re-key of getQueueStats()
+  // that keeps callers (and their service stubs) off the snake_case queue shape.
+  getJobCounts() {
+    const { pending, in_progress: inProgress } = this.getQueueStats();
+    return { pending, inProgress };
+  }
+
+  // Number of channels with realtime watch enabled. Used by the idle monitor:
+  // a server watching any channel must stay up to receive realtime updates.
+  getWatchedChannelCount() {
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS cnt
+      FROM channels
+      WHERE sync_enabled = 1
+    `).get();
+    return row?.cnt ?? 0;
+  }
+
   getQueueStats() {
     const rows = this.db.prepare(`
       SELECT status, COUNT(*) AS count
@@ -2070,6 +2094,10 @@ export default class MessageSyncService {
     void this.processQueue();
   }
 
+  // Worker-only teardown. Stops the queue loop, requeues *only* the job this
+  // instance left in_progress (so the worker resumes it next run), then releases
+  // resources via close(). Jobs owned by other processes are never touched.
+  // Non-worker commands must call close() instead — see #42.
   async shutdown() {
     this.stopRequested = true;
 
@@ -2077,14 +2105,23 @@ export default class MessageSyncService {
       await delay(100);
     }
 
-    if (this.db && this.db.open) {
+    if (this.ownedInProgressJobId !== null && this.db && this.db.open) {
       this.db.prepare(`
         UPDATE jobs
         SET status = ?, error = NULL, updated_at = CURRENT_TIMESTAMP
-        WHERE status = ?
-      `).run(JOB_STATUS.PENDING, JOB_STATUS.IN_PROGRESS);
+        WHERE id = ? AND status = ?
+      `).run(JOB_STATUS.PENDING, this.ownedInProgressJobId, JOB_STATUS.IN_PROGRESS);
+      this.ownedInProgressJobId = null;
     }
 
+    this.close();
+  }
+
+  // Non-mutating teardown for any process that isn't the queue worker. Removes
+  // realtime handlers (if registered) and closes the DB handle, but never touches
+  // the `jobs` table — so a read-only command run against a live server's store
+  // cannot corrupt the server's in-progress job (#42).
+  close() {
     if (this.realtimeActive && this.realtimeHandlers) {
       this.telegramClient.client.onNewMessage.remove(this.realtimeHandlers.newMessageHandler);
       this.telegramClient.client.onEditMessage.remove(this.realtimeHandlers.editMessageHandler);
@@ -2169,7 +2206,7 @@ export default class MessageSyncService {
     return matches;
   }
 
-  listArchivedMessages({ channelIds, topicId, fromDate, toDate, limit = 50 }) {
+  listArchivedMessages({ channelIds, topicId, fromDate, toDate, beforeId, afterId, limit = 50 }) {
     const resolvedIds = Array.isArray(channelIds) ? channelIds : (channelIds ? [channelIds] : []);
     const normalizedIds = resolvedIds.map((id) => normalizeChannelKey(id)).filter(Boolean);
     const clauses = [];
@@ -2193,6 +2230,16 @@ export default class MessageSyncService {
     if (toDate) {
       params.push(parseIsoDate(toDate));
       clauses.push('messages.date <= ?');
+    }
+
+    if (Number.isFinite(beforeId) && beforeId > 0) {
+      params.push(Number(beforeId));
+      clauses.push('messages.message_id < ?');
+    }
+
+    if (Number.isFinite(afterId) && afterId > 0) {
+      params.push(Number(afterId));
+      clauses.push('messages.message_id > ?');
     }
 
     const whereClause = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -2380,6 +2427,16 @@ export default class MessageSyncService {
     if (options.toDate) {
       params.push(parseIsoDate(options.toDate));
       clauses.push('messages.date <= ?');
+    }
+
+    if (Number.isFinite(options.beforeId) && options.beforeId > 0) {
+      params.push(Number(options.beforeId));
+      clauses.push('messages.message_id < ?');
+    }
+
+    if (Number.isFinite(options.afterId) && options.afterId > 0) {
+      params.push(Number(options.afterId));
+      clauses.push('messages.message_id > ?');
     }
 
     if (queryText) {
@@ -2674,6 +2731,9 @@ export default class MessageSyncService {
     }
 
     this._updateJobStatus(job.id, JOB_STATUS.IN_PROGRESS);
+    // Claim ownership so shutdown() requeues this job (and only this one) if the
+    // process exits before _processJob writes its terminal/pending status.
+    this.ownedInProgressJobId = job.id;
 
     try {
       const channelId = normalizeChannelKey(job.channel_id);
@@ -2722,6 +2782,11 @@ export default class MessageSyncService {
       } else {
         this._markJobError(job.id, error);
       }
+    } finally {
+      // _processJob always writes a non-in_progress status above before
+      // returning, so releasing ownership here is safe. If the process is
+      // killed mid-await instead, ownership is still set and shutdown() requeues.
+      this.ownedInProgressJobId = null;
     }
   }
 
@@ -2746,6 +2811,27 @@ export default class MessageSyncService {
       WHERE id = ?
     `).run(
       status,
+      messageCount ?? 0,
+      cursorMessageId ?? null,
+      cursorMessageDate ?? null,
+      id,
+    );
+  }
+
+  // Lightweight per-batch progress write used while a backfill run is mid-flight.
+  // Keeps `message_count`/cursor/`updated_at` live (and stamps `started_at` on the
+  // first batch) without touching status, so the control API and idle monitor can
+  // observe progress between terminal updates.
+  _updateJobProgress(id, { messageCount, cursorMessageId, cursorMessageDate }) {
+    this.db.prepare(`
+      UPDATE jobs
+      SET message_count = ?,
+          cursor_message_id = ?,
+          cursor_message_date = ?,
+          started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(
       messageCount ?? 0,
       cursorMessageId ?? null,
       cursorMessageDate ?? null,
@@ -3487,6 +3573,17 @@ export default class MessageSyncService {
         currentOldestId = lowestIdInChunk;
         currentOldestDate = lowestDateInChunk || currentOldestDate;
       }
+
+      // Persist live progress after every batch so the control API and idle
+      // monitor see the archived count and resume cursor advance mid-run, not
+      // just on terminal completion. `started_at` is stamped on the first batch.
+      this._updateJobProgress(job.id, {
+        messageCount: this._countMessages(channelId),
+        cursorMessageId: nextOffsetId ?? null,
+        cursorMessageDate: Number.isFinite(nextOffsetDate) && nextOffsetDate > 0
+          ? toIsoString(nextOffsetDate)
+          : null,
+      });
 
       if (nextOffsetId === previousOffsetId && (nextOffsetDate ?? 0) === previousOffsetDate) {
         break;

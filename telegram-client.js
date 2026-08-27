@@ -1,5 +1,9 @@
 import { TelegramClient as MtCuteClient } from '@mtcute/node';
 import { InputMedia } from '@mtcute/core';
+import { randomLong } from '@mtcute/core/utils.js';
+import { html } from '@mtcute/html-parser';
+import { md } from '@mtcute/markdown-parser';
+import QRCode from 'qrcode';
 import EventEmitter from 'events';
 import fs from 'fs';
 import { stat } from 'fs/promises';
@@ -7,6 +11,7 @@ import os from 'os';
 import path from 'path';
 import readline from 'readline';
 import { Readable } from 'stream';
+import { pipeline } from 'stream/promises';
 import { nodeReadableToFuman } from '@fuman/node';
 import { resolveStoreDir, resolveStorePaths } from './core/store.js';
 
@@ -127,6 +132,127 @@ function createPlatform() {
 
 function sanitizeString(value) {
   return typeof value === 'string' ? value : '';
+}
+
+function normalizeParseMode(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const normalized = String(value).trim().toLowerCase();
+  if (!['markdown', 'html', 'none'].includes(normalized)) {
+    throw new Error('Invalid parse mode. Allowed values: markdown, html, none');
+  }
+  return normalized;
+}
+
+function applyParseMode(text, parseMode) {
+  if (parseMode === 'markdown') return md(text);
+  if (parseMode === 'html') return html(text);
+  return text;
+}
+
+function resolveScheduleDate(options) {
+  if (options.scheduleDate !== undefined && options.scheduleDate !== null) return options.scheduleDate;
+  if (options.schedule) {
+    const date = new Date(options.schedule);
+    if (Number.isNaN(date.getTime())) {
+      throw new Error('Invalid schedule date: must be a valid ISO 8601 datetime');
+    }
+    return Math.floor(date.getTime() / 1000);
+  }
+  return undefined;
+}
+
+function resolveReplyTo(options = {}) {
+  if (Number.isFinite(options.replyToMessageId)) return options.replyToMessageId;
+  if (Number.isFinite(options.topicId)) return options.topicId;
+  return undefined;
+}
+
+function buildTextSendParams(options = {}) {
+  const params = {};
+  const replyTo = resolveReplyTo(options);
+  if (replyTo) params.replyTo = replyTo;
+  if (options.noPreview) params.disableWebPreview = true;
+  if (options.silent) params.silent = true;
+  if (options.noForwards || options.noforwards) params.forbidForwards = true;
+  const scheduleDate = resolveScheduleDate(options);
+  if (scheduleDate) params.scheduleDate = scheduleDate;
+  return Object.keys(params).length ? params : undefined;
+}
+
+function buildMediaSendParams(options = {}) {
+  const params = {};
+  const replyTo = resolveReplyTo(options);
+  if (replyTo) params.replyTo = replyTo;
+  if (options.silent) params.silent = true;
+  if (options.noForwards || options.noforwards) params.forbidForwards = true;
+  const scheduleDate = resolveScheduleDate(options);
+  if (scheduleDate) params.scheduleDate = scheduleDate;
+  if (options.captionAbove) params.invert = true;
+  return Object.keys(params).length ? params : undefined;
+}
+
+function resolveUploadPath(filePath) {
+  if (!filePath || typeof filePath !== 'string') {
+    throw new Error('filePath must be a string.');
+  }
+  const resolved = path.resolve(filePath);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`File not found: ${resolved}`);
+  }
+  return `file:${resolved}`;
+}
+
+function resolveOptionalCaption(caption) {
+  if (typeof caption !== 'string') return undefined;
+  const trimmed = caption.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function buildSendMessageResult(sent, { method, defaultMediaType } = {}) {
+  const result = { messageId: sent?.id ?? null };
+  if (method) result.method = method;
+  const media = summarizeMedia(sent?.media) ?? (defaultMediaType ? { type: defaultMediaType } : null);
+  if (media) result.media = media;
+  return result;
+}
+
+function buildLowLevelReplyTo(options = {}) {
+  const replyTo = resolveReplyTo(options);
+  if (!replyTo) return undefined;
+  return { _: 'inputReplyToMessage', replyToMsgId: replyTo };
+}
+
+function splitInputText(value) {
+  if (!value) return { message: '', entities: undefined };
+  if (typeof value === 'string') return { message: value, entities: undefined };
+  if (typeof value === 'object' && typeof value.text === 'string') {
+    return {
+      message: value.text,
+      entities: Array.isArray(value.entities) && value.entities.length > 0 ? value.entities : undefined,
+    };
+  }
+  return { message: String(value), entities: undefined };
+}
+
+function randomIdsEqual(left, right) {
+  if (left?.eq && typeof left.eq === 'function') return left.eq(right);
+  return String(left) === String(right);
+}
+
+function extractMessageIdFromSendUpdates(response, randomId) {
+  const updates = Array.isArray(response?.updates) ? response.updates : [];
+  for (const update of updates) {
+    if (update?._ === 'updateMessageID' && randomIdsEqual(update.randomId, randomId)) {
+      return update.id;
+    }
+  }
+  for (const update of updates) {
+    if (update?._ === 'updateNewMessage' || update?._ === 'updateNewChannelMessage'
+        || update?._ === 'updateNewScheduledMessage') {
+      return update.message?.id ?? null;
+    }
+  }
+  return null;
 }
 
 function coerceApiId(value) {
@@ -363,12 +489,39 @@ export function normalizeChannelId(channelId) {
   throw new Error('Invalid channel ID provided');
 }
 
+function normalizePositiveMessageId(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+}
+
+function filterSerializedMessagesById(messages, options = {}) {
+  const beforeId = normalizePositiveMessageId(options.beforeId);
+  const afterId = normalizePositiveMessageId(options.afterId);
+  if (!beforeId && !afterId) {
+    return messages;
+  }
+  return messages.filter((message) => {
+    const messageId = normalizePositiveMessageId(message?.id);
+    if (!messageId) {
+      return false;
+    }
+    if (beforeId && messageId >= beforeId) {
+      return false;
+    }
+    if (afterId && messageId <= afterId) {
+      return false;
+    }
+    return true;
+  });
+}
+
 class TelegramClient {
   constructor(apiId, apiHash, phoneNumber, sessionPath = DEFAULT_SESSION_PATH, options = {}) {
     this.apiId = coerceApiId(apiId);
     this.apiHash = sanitizeString(apiHash);
     this.phoneNumber = sanitizeString(phoneNumber);
     this.sessionPath = path.resolve(sessionPath);
+    this.options = options;
 
     const dataDir = path.dirname(this.sessionPath);
     if (!fs.existsSync(dataDir)) {
@@ -389,14 +542,61 @@ class TelegramClient {
         this.updateEmitter.emit('channelTooLong', { channelId, diff });
       },
     };
+    this.updatesConfig = updatesConfig;
+    this.client = this._createClient();
+  }
 
-    this.client = new MtCuteClient({
+  _createClient() {
+    const clientOptions = {
       apiId: this.apiId,
       apiHash: this.apiHash,
       storage: this.sessionPath,
       platform: createPlatform(),
-      updates: updatesConfig,
-    });
+    };
+    if (this.options.disableUpdates) {
+      clientOptions.disableUpdates = true;
+    } else {
+      clientOptions.updates = this.updatesConfig;
+    }
+    return new MtCuteClient(clientOptions);
+  }
+
+  _isAuthKeyUnregisteredError(error) {
+    if (!error) return false;
+    const code = error.code || error.status || error.errorCode;
+    const message = (error.errorMessage || error.text || error.message || '').toUpperCase();
+    return code === 401 && message.includes('AUTH_KEY_UNREGISTERED');
+  }
+
+  _isSessionResetError(error) {
+    if (!error) return false;
+    const message = (error.errorMessage || error.text || error.message || '').toUpperCase();
+    return message.includes('SESSION IS RESET');
+  }
+
+  async _recreateClient() {
+    try {
+      await this.client.destroy();
+    } catch (error) {
+      console.warn('[warning] failed to destroy MTProto client during reset:', error?.message || error);
+    }
+    this.client = this._createClient();
+    this.updatesRunning = false;
+    this.rawUpdateHandler = null;
+  }
+
+  async _resetSessionAndClient() {
+    const sessionFiles = [this.sessionPath, `${this.sessionPath}-wal`, `${this.sessionPath}-shm`];
+    for (const filePath of sessionFiles) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          throw error;
+        }
+      }
+    }
+    await this._recreateClient();
   }
 
   _isUnauthorizedError(error) {
@@ -437,17 +637,28 @@ class TelegramClient {
   }
 
   async _askQuestion(prompt) {
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
-
-    return new Promise(resolve => {
-      rl.question(prompt, answer => {
-        rl.close();
-        resolve(answer.trim());
+    const ask = () => {
+      if (process.stdin.isPaused()) {
+        process.stdin.resume();
+      }
+      const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
       });
-    });
+
+      return new Promise(resolve => {
+        rl.question(prompt, answer => {
+          rl.close();
+          resolve(answer.trim());
+        });
+      });
+    };
+
+    let answer = await ask();
+    if (!answer) {
+      answer = await ask();
+    }
+    return answer;
   }
 
   async _askHiddenQuestion(prompt) {
@@ -455,6 +666,9 @@ class TelegramClient {
       return this._askQuestion(prompt);
     }
 
+    if (process.stdin.isPaused()) {
+      process.stdin.resume();
+    }
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
@@ -478,29 +692,102 @@ class TelegramClient {
     });
   }
 
-  async login() {
-    try {
-      if (await this._isAuthorized()) {
-        console.log('Existing session is valid.');
-        return true;
-      }
+  _buildStartParams() {
+    const startParams = {
+      password: async () => {
+        const value = await this._askHiddenQuestion('Enter your 2FA password (leave empty if not enabled): ');
+        return value.length ? value : undefined;
+      },
+    };
 
-      if (!this.phoneNumber) {
+    if (this.options.useQr) {
+      startParams.qrCodeHandler = async (url, expiresAt) => {
+        const expiresLabel = expiresAt instanceof Date && !Number.isNaN(expiresAt.getTime())
+          ? expiresAt.toISOString()
+          : 'unknown';
+        let qrFile = null;
+
+        if (this.options.qrFilePath) {
+          qrFile = this.options.qrFilePath;
+          await QRCode.toFile(qrFile, url, { type: 'png', width: 300 });
+        }
+
+        if (this.options.json) {
+          process.stderr.write(`${JSON.stringify({
+            event: 'qr',
+            url,
+            expiresAt: expiresLabel,
+            qrFile,
+          })}\n`);
+          return;
+        }
+
+        console.log('\nScan this QR code in Telegram: Settings -> Devices -> Link Desktop Device');
+        const terminalQr = await QRCode.toString(url, { type: 'terminal', small: true });
+        console.log(terminalQr);
+        console.log(`QR expires at: ${expiresLabel}`);
+        if (qrFile) {
+          console.log(`QR saved to: ${qrFile}`);
+        }
+      };
+    } else {
+      startParams.phone = this.phoneNumber;
+      startParams.code = async () => await this._askQuestion('Enter the code you received: ');
+      startParams.codeSentCallback = async (sentCode) => {
+        if (this.options.forceSms && (sentCode.type === 'app' || sentCode.type === 'email')) {
+          try {
+            await this.client.resendCode({ phone: this.phoneNumber, phoneCodeHash: sentCode.phoneCodeHash });
+            console.log('Code re-sent via SMS.');
+          } catch (error) {
+            const message = (error.text || error.message || '').toUpperCase();
+            if (message.includes('SEND_CODE_UNAVAILABLE')) {
+              console.log('SMS unavailable for this number. Please use the code sent via app.');
+            } else {
+              console.log(`Could not request SMS (${error.text || error.message}). Using code sent via ${sentCode.type}.`);
+            }
+          }
+        } else {
+          console.log(`The confirmation code has been sent via ${sentCode.type}.`);
+        }
+      };
+    }
+
+    return startParams;
+  }
+
+  async login(retriedAfterReset = false, retriedAfterSessionReset = false) {
+    try {
+      const hasExistingSession = await this._isAuthorized();
+
+      if (!hasExistingSession && !this.options.useQr && !this.phoneNumber) {
         throw new Error('TELEGRAM_PHONE_NUMBER is not configured.');
       }
 
-      await this.client.start({
-        phone: this.phoneNumber,
-        code: async () => await this._askQuestion('Enter the code you received: '),
-        password: async () => {
-          const value = await this._askHiddenQuestion('Enter your 2FA password (leave empty if not enabled): ');
-          return value.length ? value : undefined;
-        },
-      });
+      await this.client.start(this._buildStartParams());
 
-      console.log('Logged in successfully!');
+      console.log(hasExistingSession ? 'Existing session is valid.' : 'Logged in successfully!');
       return true;
     } catch (error) {
+      if (!retriedAfterReset && this._isAuthKeyUnregisteredError(error)) {
+        console.log('Detected AUTH_KEY_UNREGISTERED. Resetting local session and retrying login once...');
+        try {
+          await this._resetSessionAndClient();
+          return await this.login(true, retriedAfterSessionReset);
+        } catch (resetError) {
+          console.error('Failed to recover from AUTH_KEY_UNREGISTERED:', resetError);
+          return false;
+        }
+      }
+      if (!retriedAfterSessionReset && this._isSessionResetError(error)) {
+        console.log('Detected session reset during login. Recreating MTProto client and retrying once...');
+        try {
+          await this._recreateClient();
+          return await this.login(retriedAfterReset, true);
+        } catch (resetError) {
+          console.error('Failed to recover from session reset:', resetError);
+          return false;
+        }
+      }
       console.error('Error during login:', error);
       return false;
     }
@@ -524,38 +811,51 @@ class TelegramClient {
     return true;
   }
 
-  async listDialogs(limit = 50) {
-    await this.ensureLogin();
-    const effectiveLimit = limit && limit > 0 ? limit : Infinity;
-    const results = [];
+  async listDialogs(limit = 50, retriedAfterSessionReset = false) {
+    try {
+      await this.ensureLogin();
+      const effectiveLimit = limit && limit > 0 ? limit : Infinity;
+      const results = [];
 
-    for await (const dialog of this.client.iterDialogs({})) {
-      const peer = dialog.peer;
-      if (!peer) continue;
+      for await (const dialog of this.client.iterDialogs({})) {
+        const peer = dialog.peer;
+        if (!peer) continue;
 
-      const id = peer.id.toString();
-      const username = 'username' in peer ? peer.username ?? null : null;
-      const chatType = typeof peer.chatType === 'string' ? peer.chatType : null;
-      const isForum = typeof peer.isForum === 'boolean' ? peer.isForum : null;
-      const isGroup = typeof peer.isGroup === 'boolean' ? peer.isGroup : null;
-      results.push({
-        id,
-        type: normalizePeerType(peer),
-        title: peer.displayName || 'Unknown',
-        username,
-        chatType,
-        isForum,
-        isGroup,
-        unreadCount: typeof dialog.unreadCount === 'number' ? dialog.unreadCount : 0,
-        unreadMentionsCount: typeof dialog.unreadMentionsCount === 'number' ? dialog.unreadMentionsCount : 0,
-      });
+        const id = peer.id.toString();
+        const username = 'username' in peer ? peer.username ?? null : null;
+        const chatType = typeof peer.chatType === 'string' ? peer.chatType : null;
+        const isForum = typeof peer.isForum === 'boolean' ? peer.isForum : null;
+        const isGroup = typeof peer.isGroup === 'boolean' ? peer.isGroup : null;
+        results.push({
+          id,
+          type: normalizePeerType(peer),
+          title: peer.displayName || 'Unknown',
+          username,
+          chatType,
+          isForum,
+          isGroup,
+          unreadCount: typeof dialog.unreadCount === 'number' ? dialog.unreadCount : 0,
+          unreadMentionsCount: typeof dialog.unreadMentionsCount === 'number' ? dialog.unreadMentionsCount : 0,
+        });
 
-      if (results.length >= effectiveLimit) {
-        break;
+        if (results.length >= effectiveLimit) {
+          break;
+        }
       }
-    }
 
-    return results;
+      return results;
+    } catch (error) {
+      if (!retriedAfterSessionReset && this._isSessionResetError(error)) {
+        console.log('Detected session reset while listing dialogs. Recreating MTProto client and retrying once...');
+        await this._recreateClient();
+        const loginSuccess = await this.login();
+        if (!loginSuccess) {
+          throw new Error('Failed to restore session after dialog fetch reset.');
+        }
+        return this.listDialogs(limit, true);
+      }
+      throw error;
+    }
   }
 
   async searchPeers(query, limit = 50) {
@@ -644,30 +944,45 @@ class TelegramClient {
       maxId = 0,
       reverse = false,
       offsetId = 0,
+      beforeId = 0,
+      afterId = 0,
     } = options;
     const peerRef = normalizeChannelId(channelId);
     const peer = await this.client.resolvePeer(peerRef);
 
     const effectiveLimit = limit && limit > 0 ? limit : 100;
+    const effectiveBeforeId = normalizePositiveMessageId(beforeId)
+      || normalizePositiveMessageId(offsetId);
+    const effectiveAfterId = normalizePositiveMessageId(afterId);
+    const effectiveMinId = effectiveAfterId || normalizePositiveMessageId(minId);
+    const effectiveMaxId = normalizePositiveMessageId(maxId);
+    const useAfterIdPagination = Boolean(effectiveAfterId);
     const messages = [];
 
     const iterOptions = {
       limit: effectiveLimit,
       chunkSize: Math.min(effectiveLimit, 100),
-      reverse,
+      reverse: useAfterIdPagination ? true : reverse,
     };
 
-    if (minId) {
-      iterOptions.minId = minId;
+    if (effectiveMinId) {
+      iterOptions.minId = effectiveMinId;
     }
 
-    if (maxId) {
-      iterOptions.maxId = maxId;
+    if (effectiveMaxId) {
+      iterOptions.maxId = effectiveMaxId;
     }
 
-    if (offsetId) {
-      iterOptions.offset = { id: offsetId, date: 0 };
-      iterOptions.addOffset = 0;
+    if (effectiveBeforeId) {
+      if (useAfterIdPagination || iterOptions.maxId) {
+        const boundedMaxId = Math.max(0, effectiveBeforeId - 1);
+        iterOptions.maxId = iterOptions.maxId
+          ? Math.min(iterOptions.maxId, boundedMaxId)
+          : boundedMaxId;
+      } else {
+        iterOptions.offset = { id: effectiveBeforeId, date: 0 };
+        iterOptions.addOffset = 0;
+      }
     }
 
     for await (const message of this.client.iterHistory(peer, iterOptions)) {
@@ -677,11 +992,18 @@ class TelegramClient {
       }
     }
 
+    if (useAfterIdPagination) {
+      messages.reverse();
+    }
+
     return {
       peerTitle: peer?.displayName || 'Unknown',
       peerId: peer?.id?.toString?.() ?? String(channelId),
       peerType: normalizePeerType(peer),
-      messages,
+      messages: filterSerializedMessagesById(messages, {
+        beforeId: effectiveBeforeId,
+        afterId: effectiveAfterId,
+      }),
     };
   }
 
@@ -765,7 +1087,10 @@ class TelegramClient {
       limit,
       query,
     });
-    const messages = results.map((message) => this._serializeMessage(message, peer));
+    const messages = filterSerializedMessagesById(
+      results.map((message) => this._serializeMessage(message, peer)),
+      options,
+    );
 
     return {
       peerTitle: peer?.displayName || 'Unknown',
@@ -783,40 +1108,109 @@ class TelegramClient {
     if (!messageText.trim()) {
       throw new Error('Message text cannot be empty.');
     }
-    const replyTo = Number.isFinite(options.replyToMessageId)
-      ? options.replyToMessageId
-      : (Number.isFinite(options.topicId) ? options.topicId : undefined);
-    const params = replyTo ? { replyTo } : undefined;
+    const parseMode = normalizeParseMode(options.parseMode);
+    const inputText = applyParseMode(messageText, parseMode);
+    const params = buildTextSendParams(options);
     const peerRef = normalizeChannelId(channelId);
-    const sent = await this.client.sendText(peerRef, messageText, params);
+    const sent = await this.client.sendText(peerRef, inputText, params);
     return { messageId: sent.id };
   }
 
   async sendFileMessage(channelId, filePath, options = {}) {
     await this.ensureLogin();
-    if (!filePath || typeof filePath !== 'string') {
-      throw new Error('filePath must be a string.');
+    const uploadPath = resolveUploadPath(filePath);
+    const caption = resolveOptionalCaption(options.caption);
+    const parseMode = normalizeParseMode(options.parseMode);
+    if (parseMode && !caption) {
+      throw new Error('--parse-mode requires --caption for send file');
     }
-    const resolved = path.resolve(filePath);
-    if (!fs.existsSync(resolved)) {
-      throw new Error(`File not found: ${resolved}`);
-    }
-    const uploadPath = `file:${resolved}`;
-    const caption = typeof options.caption === 'string' && options.caption.trim()
-      ? options.caption
-      : undefined;
+    const parsedCaption = caption ? applyParseMode(caption, parseMode) : undefined;
     const fileName = typeof options.filename === 'string' && options.filename.trim()
-      ? options.filename.trim()
-      : undefined;
-    const replyTo = Number.isFinite(options.topicId) ? options.topicId : undefined;
-    const params = replyTo ? { replyTo } : undefined;
-    const media = InputMedia.auto(uploadPath, {
-      caption,
-      fileName,
-    });
+      ? options.filename.trim() : undefined;
+    if (options.captionAbove && !caption) {
+      throw new Error('--caption-above requires --caption for send file');
+    }
+    const mediaOptions = { caption: parsedCaption, fileName };
+    if (options.spoiler) mediaOptions.spoiler = true;
+    if (options.forceDocument) mediaOptions.forceDocument = true;
+    const media = InputMedia.auto(uploadPath, mediaOptions);
     const peerRef = normalizeChannelId(channelId);
-    const sent = await this.client.sendMedia(peerRef, media, params);
-    return { messageId: sent.id };
+    const sent = await this.client.sendMedia(peerRef, media, buildMediaSendParams(options));
+    return buildSendMessageResult(sent, { method: 'sendDocument', defaultMediaType: 'document' });
+  }
+
+  async preparePhotoMessage(channelId, filePath, options = {}) {
+    await this.ensureLogin();
+    const uploadPath = resolveUploadPath(filePath);
+    const caption = resolveOptionalCaption(options.caption);
+    const parseMode = normalizeParseMode(options.parseMode);
+    if (parseMode && !caption) {
+      throw new Error('--parse-mode requires --caption for send photo');
+    }
+    if (options.captionAbove && !caption) {
+      throw new Error('--caption-above requires --caption for send photo');
+    }
+    const mediaOptions = {};
+    let parsedCaption;
+    if (caption) {
+      parsedCaption = applyParseMode(caption, parseMode);
+      mediaOptions.caption = parsedCaption;
+    }
+    if (options.spoiler) mediaOptions.spoiler = true;
+    const media = InputMedia.photo(uploadPath, mediaOptions);
+    const { message, entities } = splitInputText(parsedCaption);
+    return {
+      method: 'sendPhoto',
+      peerRef: normalizeChannelId(channelId),
+      media,
+      request: {
+        _: 'messages.sendMedia',
+        silent: options.silent ? true : undefined,
+        replyTo: buildLowLevelReplyTo(options),
+        randomId: options.randomId ?? randomLong(),
+        scheduleDate: resolveScheduleDate(options),
+        message,
+        entities,
+        noforwards: options.noForwards || options.noforwards ? true : undefined,
+        invertMedia: options.captionAbove ? true : undefined,
+      },
+    };
+  }
+
+  async sendPreparedPhotoMessage(prepared) {
+    const peer = await this.client.resolvePeer(prepared.peerRef);
+    const chatId = peer?._ === 'inputPeerSelf'
+      ? String(prepared.peerRef)
+      : this._extractPeerId(peer);
+    const normalizedMedia = await this.client._normalizeInputMedia(prepared.media, { uploadPeer: peer });
+    const request = { ...prepared.request, peer, media: normalizedMedia };
+    const result = await this.client.call(request);
+    this.client.handleClientUpdate(result, true);
+    const messageId = extractMessageIdFromSendUpdates(result, prepared.request.randomId);
+    if (!messageId) {
+      throw new Error('Failed to resolve sent photo message id from Telegram updates.');
+    }
+    let sent;
+    try {
+      [sent] = await this.client.getMessages(prepared.peerRef, Number(messageId));
+    } catch (error) {
+      console.error(`[sendPhoto] getMessages enrichment failed for peer ${prepared.peerRef}, message ${messageId}: ${error.message}`);
+    }
+    if (sent) {
+      return { chatId, ...buildSendMessageResult(sent, { method: 'sendPhoto', defaultMediaType: 'photo' }) };
+    }
+    return {
+      chatId,
+      messageId: Number(messageId),
+      method: 'sendPhoto',
+      media: { type: 'photo' },
+      warning: 'Media enrichment failed; file_id unavailable',
+    };
+  }
+
+  async sendPhotoMessage(channelId, filePath, options = {}) {
+    const prepared = await this.preparePhotoMessage(channelId, filePath, options);
+    return this.sendPreparedPhotoMessage(prepared);
   }
 
   async downloadMessageMedia(channelId, messageId, options = {}) {
@@ -839,7 +1233,20 @@ class TelegramClient {
       summary,
     });
     fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-    await this.client.downloadToFile(targetPath, location);
+    // Do not switch to mtcute's downloadToFile: it resolves before its write
+    // stream flushes, so an immediate stat can report 0 bytes. pipeline
+    // resolves only after the destination stream finishes, so the stat below
+    // always sees the complete file.
+    try {
+      await pipeline(this.client.downloadAsNodeStream(location), fs.createWriteStream(targetPath));
+    } catch (error) {
+      try {
+        fs.rmSync(targetPath, { force: true });
+      } catch {
+        // Best-effort cleanup of the partial file; surface the original error.
+      }
+      throw error;
+    }
     const stats = fs.statSync(targetPath);
 
     return {
@@ -1130,6 +1537,13 @@ class TelegramClient {
     };
   }
 
+  _extractPeerId(peer) {
+    if (peer == null) return 'unknown';
+    if (typeof peer !== 'object') return String(peer);
+    const id = peer.userId ?? peer.channelId ?? peer.chatId;
+    return id != null ? String(id) : 'unknown';
+  }
+
   filterMessagesByPattern(messages, pattern) {
     if (!Array.isArray(messages)) {
       return [];
@@ -1200,13 +1614,253 @@ class TelegramClient {
       limit,
       query: options.query ?? '',
     });
-    const messages = results.map((message) => this._serializeMessage(message, message.chat));
+    const messages = filterSerializedMessagesById(
+      results.map((message) => this._serializeMessage(message, message.chat)),
+      options,
+    );
 
     return {
       total: results.total ?? messages.length,
       next: results.next ?? null,
       messages,
     };
+  }
+  // --- Chat Folders ---
+
+  async getFolders() {
+    await this.ensureLogin();
+    const result = await this.client.getFolders();
+    const filters = result?.filters ?? [];
+    return filters.map((f) => {
+      if (f._ === 'dialogFilterDefault') return { id: 0, title: 'All Chats', type: 'default' };
+      return {
+        id: f.id,
+        title: typeof f.title === 'string' ? f.title : (f.title?.text ?? 'Unknown'),
+        emoji: f.emoticon ?? null,
+        color: f.color ?? null,
+        type: f._ === 'dialogFilterChatlist' ? 'chatlist' : 'filter',
+        contacts: f.contacts ?? false,
+        nonContacts: f.nonContacts ?? false,
+        groups: f.groups ?? false,
+        broadcasts: f.broadcasts ?? false,
+        bots: f.bots ?? false,
+        excludeMuted: f.excludeMuted ?? false,
+        excludeRead: f.excludeRead ?? false,
+        excludeArchived: f.excludeArchived ?? false,
+        includePeers: f.includePeers?.length ?? 0,
+        excludePeers: f.excludePeers?.length ?? 0,
+        pinnedPeers: f.pinnedPeers?.length ?? 0,
+      };
+    });
+  }
+
+  async findFolder(idOrName) {
+    await this.ensureLogin();
+    const trimmed = String(idOrName).trim();
+    if (trimmed === '') throw new Error('Folder identifier cannot be empty');
+    if (/^\d+$/.test(trimmed)) return this.client.findFolder({ id: Number(trimmed) });
+    return this.client.findFolder({ title: trimmed });
+  }
+
+  async showFolder(idOrName, options = {}) {
+    await this.ensureLogin();
+    const folder = await this.findFolder(idOrName);
+    if (!folder) throw new Error(`Folder not found: ${idOrName}`);
+
+    const normalizePeers = (peers) => (peers ?? []).map((p) => this._normalizePeer(p));
+
+    const resolvePeers = async (peers) => {
+      const normalized = normalizePeers(peers);
+      if (!options.resolve) return normalized;
+
+      return Promise.all(normalized.map(async (peer) => {
+        const name = await this._resolvePeerName(peer.type, peer.id);
+        const nameField = peer.type === 'user' ? 'name' : 'title';
+        return { ...peer, [nameField]: name ?? '(unresolved)' };
+      }));
+    };
+
+    return {
+      id: folder.id,
+      title: typeof folder.title === 'string' ? folder.title : (folder.title?.text ?? 'Unknown'),
+      emoji: folder.emoticon ?? null,
+      color: folder.color ?? null,
+      type: folder._ === 'dialogFilterChatlist' ? 'chatlist' : folder._ === 'dialogFilterDefault' ? 'default' : 'filter',
+      contacts: folder.contacts ?? false,
+      nonContacts: folder.nonContacts ?? false,
+      groups: folder.groups ?? false,
+      broadcasts: folder.broadcasts ?? false,
+      bots: folder.bots ?? false,
+      excludeMuted: folder.excludeMuted ?? false,
+      excludeRead: folder.excludeRead ?? false,
+      excludeArchived: folder.excludeArchived ?? false,
+      includePeers: await resolvePeers(folder.includePeers),
+      excludePeers: await resolvePeers(folder.excludePeers),
+      pinnedPeers: await resolvePeers(folder.pinnedPeers),
+    };
+  }
+
+  async createFolder(options) {
+    await this.ensureLogin();
+    if (!options.title) throw new Error('Folder title is required');
+    const params = { title: options.title };
+    if (options.emoji) params.emoticon = options.emoji;
+    if (options.contacts !== undefined) params.contacts = options.contacts;
+    if (options.nonContacts !== undefined) params.nonContacts = options.nonContacts;
+    if (options.groups !== undefined) params.groups = options.groups;
+    if (options.broadcasts !== undefined) params.broadcasts = options.broadcasts;
+    if (options.bots !== undefined) params.bots = options.bots;
+    if (options.excludeMuted !== undefined) params.excludeMuted = options.excludeMuted;
+    if (options.excludeRead !== undefined) params.excludeRead = options.excludeRead;
+    if (options.excludeArchived !== undefined) params.excludeArchived = options.excludeArchived;
+    if (options.includePeers?.length) params.includePeers = options.includePeers;
+    if (options.excludePeers?.length) params.excludePeers = options.excludePeers;
+    if (options.pinnedPeers?.length) params.pinnedPeers = options.pinnedPeers;
+    const result = await this.client.createFolder(params);
+    return { id: result.id, title: typeof result.title === 'string' ? result.title : (result.title?.text ?? 'Unknown') };
+  }
+
+  async editFolder(idOrName, modification) {
+    await this.ensureLogin();
+    const folder = await this.findFolder(idOrName);
+    if (!folder) throw new Error(`Folder not found: ${idOrName}`);
+    if (this._isDefaultFolder(folder)) throw new Error('Cannot modify the default "All Chats" folder');
+    const mod = {};
+    if (modification.title !== undefined) mod.title = modification.title;
+    if (modification.emoji !== undefined) mod.emoticon = modification.emoji;
+    if (modification.contacts !== undefined) mod.contacts = modification.contacts;
+    if (modification.nonContacts !== undefined) mod.nonContacts = modification.nonContacts;
+    if (modification.groups !== undefined) mod.groups = modification.groups;
+    if (modification.broadcasts !== undefined) mod.broadcasts = modification.broadcasts;
+    if (modification.bots !== undefined) mod.bots = modification.bots;
+    if (modification.excludeMuted !== undefined) mod.excludeMuted = modification.excludeMuted;
+    if (modification.excludeRead !== undefined) mod.excludeRead = modification.excludeRead;
+    if (modification.excludeArchived !== undefined) mod.excludeArchived = modification.excludeArchived;
+    if (modification.includePeers !== undefined) mod.includePeers = modification.includePeers;
+    if (modification.excludePeers !== undefined) mod.excludePeers = modification.excludePeers;
+    if (modification.pinnedPeers !== undefined) mod.pinnedPeers = modification.pinnedPeers;
+    const result = await this.client.editFolder({ folder, modification: mod });
+    return { id: result.id, title: typeof result.title === 'string' ? result.title : (result.title?.text ?? 'Unknown') };
+  }
+
+  async deleteFolder(idOrName) {
+    await this.ensureLogin();
+    const folder = await this.findFolder(idOrName);
+    if (!folder) throw new Error(`Folder not found: ${idOrName}`);
+    if (this._isDefaultFolder(folder)) throw new Error('Cannot delete the default "All Chats" folder');
+    await this.client.deleteFolder(folder.id);
+    return { deleted: true, id: folder.id };
+  }
+
+  async setFoldersOrder(ids) {
+    await this.ensureLogin();
+    if (!ids.length) throw new Error('At least one folder ID is required');
+    const numericIds = ids.map((id) => {
+      const n = Number(id);
+      if (!Number.isInteger(n) || n < 0) throw new Error(`Invalid folder ID: ${id}`);
+      return n;
+    });
+    const unique = new Set(numericIds);
+    if (unique.size !== numericIds.length) throw new Error('Duplicate folder IDs are not allowed');
+    await this.client.setFoldersOrder(numericIds);
+    return { ok: true };
+  }
+
+  async addChatToFolder(idOrName, chatId) {
+    await this.ensureLogin();
+    const folder = await this.findFolder(idOrName);
+    if (!folder) throw new Error(`Folder not found: ${idOrName}`);
+    if (this._isDefaultFolder(folder)) throw new Error('Cannot modify the default "All Chats" folder');
+    const peers = folder.includePeers ? [...folder.includePeers] : [];
+    const chatIdStr = String(chatId);
+    const alreadyIncluded = peers.some((p) => {
+      const id = this._extractPeerId(p);
+      return id === chatIdStr;
+    });
+    if (alreadyIncluded) throw new Error(`Chat ${chatId} already in folder ${folder.id}`);
+    peers.push(chatId);
+    await this.client.editFolder({ folder, modification: { includePeers: peers } });
+    return { ok: true, folderId: folder.id };
+  }
+
+  async removeChatFromFolder(idOrName, chatId) {
+    await this.ensureLogin();
+    const folder = await this.findFolder(idOrName);
+    if (!folder) throw new Error(`Folder not found: ${idOrName}`);
+    if (this._isDefaultFolder(folder)) throw new Error('Cannot modify the default "All Chats" folder');
+    const chatIdStr = String(chatId);
+    const originalPeers = folder.includePeers ?? [];
+    const peers = originalPeers.filter((p) => {
+      const peerId = this._extractPeerId(p);
+      return peerId !== chatIdStr;
+    });
+    if (peers.length === originalPeers.length) {
+      throw new Error(`Chat ${chatId} not found in folder ${folder.id}`);
+    }
+    await this.client.editFolder({ folder, modification: { includePeers: peers } });
+    return { ok: true, folderId: folder.id };
+  }
+
+  async joinChatlist(link) {
+    await this.ensureLogin();
+    if (!/^https?:\/\/t\.me\/addlist\/[a-zA-Z0-9_-]+\/?(\?[^\s]*)?$/.test(link)) {
+      throw new Error(`Invalid chatlist link: ${link}. Expected format: https://t.me/addlist/<slug>`);
+    }
+    const result = await this.client.joinChatlist(link);
+    if (!result) throw new Error(`Failed to join chatlist: no result returned for ${link}`);
+    return {
+      id: result.id,
+      title: typeof result.title === 'string' ? result.title : (result.title?.text ?? 'Unknown'),
+      type: 'chatlist',
+    };
+  }
+
+  // --- Folder helper methods ---
+
+  _isDefaultFolder(folder) {
+    return folder.id === 0 || folder._ === 'dialogFilterDefault';
+  }
+
+  _extractPeerId(peer) {
+    if (peer == null) throw new Error(`Peer is ${peer}, cannot extract ID`);
+    if (typeof peer !== 'object') return String(peer);
+    const id = peer.userId ?? peer.channelId ?? peer.chatId;
+    if (id == null) throw new Error(`Peer object has no recognizable ID field: ${JSON.stringify(peer)}`);
+    return String(id);
+  }
+
+  _normalizePeer(peer) {
+    if (peer == null) throw new Error(`Peer is ${peer}, cannot normalize`);
+    if (typeof peer !== 'object') throw new Error(`Peer must be an object, got ${typeof peer}`);
+
+    let type, id;
+    if (peer.userId != null) {
+      type = 'user';
+      id = Number(peer.userId);
+    } else if (peer.channelId != null) {
+      type = 'channel';
+      id = Number(peer.channelId);
+    } else if (peer.chatId != null) {
+      type = 'chat';
+      id = Number(peer.chatId);
+    } else {
+      throw new Error(`Peer object has no recognizable ID field: ${JSON.stringify(peer)}`);
+    }
+
+    return { type, id };
+  }
+
+  async _resolvePeerName(type, id) {
+    try {
+      if (type === 'user') {
+        const user = await this.client.getFullUser(id);
+        return user.displayName || user.firstName || null;
+      }
+      const chat = await this.client.getChat(id);
+      return chat.displayName || chat.title || null;
+    } catch {
+      return null;
+    }
   }
 }
 
