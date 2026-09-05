@@ -55,3 +55,47 @@ export class SubscriptionHub {
     return this.subscribers.size;
   }
 }
+
+/**
+ * Parse `?channels=&types=&since=` into a filter plus a replay cursor.
+ *
+ * Channel ids are used verbatim. They must be archive-form ("-100…" for
+ * supergroups and channels, a plain id for DMs) — the same form
+ * listActiveChannels and messagesList return. Deriving that form here is not
+ * possible without guessing: prefixing every positive id with "-100" would
+ * silently mis-route direct messages.
+ */
+export function parseSubscribeQuery(searchParams) {
+  const rawChannels = (searchParams.get('channels') ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  if (!rawChannels.length) {
+    return { ok: false, error: 'channels is required (comma-separated channel ids)' };
+  }
+
+  const channels = new Set(rawChannels);
+
+  const rawTypes = (searchParams.get('types') ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const types = new Set(rawTypes.length ? rawTypes : SUBSCRIBABLE_TYPES);
+  for (const type of types) {
+    if (!SUBSCRIBABLE_TYPES.includes(type)) {
+      return { ok: false, error: `unknown event type: ${type}` };
+    }
+  }
+
+  const rawSince = searchParams.get('since');
+  let since = null;
+  if (rawSince !== null && rawSince !== '') {
+    since = Number(rawSince);
+    if (!Number.isInteger(since) || since < 0) {
+      return { ok: false, error: `since must be a non-negative integer, got: ${rawSince}` };
+    }
+  }
+
+  return { ok: true, filter: { channels, types }, since };
+}
