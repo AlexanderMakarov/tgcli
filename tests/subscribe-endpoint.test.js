@@ -156,3 +156,113 @@ describe('handleSubscribeRequest', () => {
     expect(hub.size).toBe(0);
   });
 });
+
+describe('per-channel cursors', () => {
+  const A = '-1003713035210';
+  const B = '-5508552085';
+  const row = (channelId, id) => ({ channelId, messageId: id, text: `m${id}` });
+
+  it('replays each channel from its own cursor', async () => {
+    const asked = [];
+    const base = await startServer({
+      replay: ({ channelIds, sinceMessageId }) => {
+        asked.push({ channel: channelIds[0], since: sinceMessageId });
+        return channelIds[0] === A
+          ? [row(A, 159)]
+          : [row(B, 58606)];
+      },
+    });
+
+    const response = await fetch(`${base}/subscribe?channels=${A}:158,${B}:58605`);
+    const events = await readEvents(response, 2);
+
+    // Each channel must be asked with ITS cursor, not a shared minimum.
+    expect(asked).toEqual([
+      { channel: A, since: 158 },
+      { channel: B, since: 58605 },
+    ]);
+    expect(events.map(e => e.data.messageId).sort()).toEqual([159, 58606]);
+  });
+
+  it('does not let one channel starve another with the replay cap', async () => {
+    // A sits far above the other channel's id range. With a shared cursor its
+    // whole history would consume maxReplay and B would get a gap instead of
+    // its real backlog.
+    const base = await startServer({
+      maxReplay: 2,
+      replay: ({ channelIds }) =>
+        channelIds[0] === A
+          ? [row(A, 1), row(A, 2), row(A, 3)]
+          : [row(B, 58606)],
+    });
+
+    const response = await fetch(`${base}/subscribe?channels=${A}:0,${B}:58605`);
+    const events = await readEvents(response, 2);
+
+    const gap = events.find(e => e.type === 'gap');
+    const msg = events.find(e => e.type === 'message.new');
+    expect(gap?.data.channelId).toBe(A);
+    expect(msg?.data.messageId).toBe(58606);
+  });
+
+  it('falls back to the global since for a bare id', async () => {
+    const asked = [];
+    const base = await startServer({
+      replay: ({ channelIds, sinceMessageId }) => {
+        asked.push({ channel: channelIds[0], since: sinceMessageId });
+        return [];
+      },
+    });
+
+    await fetch(`${base}/subscribe?channels=${A},${B}:58605&since=100`);
+    await new Promise(r => setTimeout(r, 150));
+
+    expect(asked).toEqual([
+      { channel: A, since: 100 },
+      { channel: B, since: 58605 },
+    ]);
+  });
+
+  it('rejects a malformed cursor', async () => {
+    const base = await startServer();
+    const response = await fetch(`${base}/subscribe?channels=${A}:abc`);
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toMatch(/cursor/);
+  });
+
+  it('does not let two channels with the same message id suppress each other', async () => {
+    // Must exercise the LIVE path: the replay loop writes without consulting
+    // the dedup set, so a replay-only test passes even with a bare-id key.
+    const base = await startServer({
+      replay: ({ channelIds }) => (channelIds[0] === A ? [row(A, 7)] : []),
+    });
+
+    const response = await fetch(`${base}/subscribe?channels=${A}:0,${B}:0`);
+
+    setTimeout(() => {
+      // Same message id, different channel — both must arrive.
+      hub.publish({ type: 'message.new', channelId: B, messageId: 7, message: row(B, 7) });
+    }, 60);
+
+    const events = await readEvents(response, 2);
+    expect(events.map(e => e.data.channelId).sort()).toEqual([A, B].sort());
+  });
+
+  it('still suppresses a true duplicate within one channel', async () => {
+    const base = await startServer({
+      replay: ({ channelIds }) => (channelIds[0] === A ? [row(A, 7)] : []),
+    });
+
+    const response = await fetch(`${base}/subscribe?channels=${A}:0`);
+
+    setTimeout(() => {
+      // Already covered by the replay above — must not be delivered twice.
+      hub.publish({ type: 'message.new', channelId: A, messageId: 7, message: row(A, 7) });
+      hub.publish({ type: 'message.new', channelId: A, messageId: 8, message: row(A, 8) });
+    }, 60);
+
+    const events = await readEvents(response, 2);
+    expect(events.map(e => e.data.messageId)).toEqual([7, 8]);
+  });
+});
