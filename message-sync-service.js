@@ -2226,6 +2226,53 @@ export default class MessageSyncService {
     return rows.map((row) => formatArchivedRow(row));
   }
 
+  /**
+   * Messages newer than a cursor, oldest first — the replay half of the
+   * /subscribe endpoint.
+   *
+   * Distinct from listArchivedMessages, which orders date DESC for the
+   * messagesList tool. Replay must be ascending by message_id so a consumer
+   * can advance its cursor monotonically and resume from the last id it
+   * actually handled.
+   */
+  listArchivedMessagesSince({ channelIds, sinceMessageId = 0, limit = 500 }) {
+    const resolvedIds = Array.isArray(channelIds) ? channelIds : (channelIds ? [channelIds] : []);
+    const normalizedIds = resolvedIds.map((id) => normalizeChannelKey(id)).filter(Boolean);
+    if (!normalizedIds.length) {
+      return [];
+    }
+
+    const finalLimit = limit && limit > 0 ? Number(limit) : 500;
+    const params = [...normalizedIds, Number(sinceMessageId) || 0, finalLimit];
+
+    const rows = this.db.prepare(`
+      SELECT
+        messages.channel_id,
+        channels.peer_title,
+        channels.username,
+        messages.message_id,
+        messages.date,
+        messages.from_id,
+        messages.text,
+        messages.topic_id,
+        users.username AS from_username,
+        users.display_name AS from_display_name,
+        users.peer_type AS from_peer_type,
+        users.is_bot AS from_is_bot,
+        ${MEDIA_COLUMNS}
+      FROM messages
+      LEFT JOIN channels ON channels.channel_id = messages.channel_id
+      LEFT JOIN users ON users.user_id = messages.from_id
+      ${MEDIA_JOIN}
+      WHERE messages.channel_id IN (${normalizedIds.map(() => '?').join(', ')})
+        AND messages.message_id > ?
+      ORDER BY messages.message_id ASC
+      LIMIT ?
+    `).all(...params);
+
+    return rows.map((row) => formatArchivedRow(row));
+  }
+
   getArchivedMessage({ channelId, messageId }) {
     const normalizedId = normalizeChannelKey(channelId);
     const row = this.db.prepare(`
