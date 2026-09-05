@@ -76,6 +76,41 @@ tgcli config set mcp.port 8080
 
 Then run `tgcli server` and point your client at the configured address.
 
+## Subscriptions (`GET /subscribe`)
+
+Stream new and edited messages as Server-Sent Events. Served by the MCP HTTP
+server, alongside `/health` and `/mcp`.
+
+```
+GET /subscribe?channels=-1003713035210&types=message.new,message.edit&since=154
+```
+
+| Param | Meaning |
+|---|---|
+| `channels` | Comma-separated channel ids. Required. Must be archive-form ids — the same form `listActiveChannels` and `messagesList` return (`-100…` for channels and supergroups, a plain id for DMs). |
+| `types` | Comma-separated subset of `message.new`, `message.edit`. Defaults to both. |
+| `since` | Last message id already handled. Replays from the archive past it, then streams live. Omit for live-only. |
+
+```
+id: 155
+event: message.new
+data: {"channelId":"-1003713035210","messageId":155,"date":"…","text":"…"}
+
+: ping
+```
+
+The `data` payload is the same shape `messagesList` returns, so one parser
+serves both replay and live. A `: ping` comment every 25s keeps intermediaries
+from idling the connection out. If more than 500 messages are pending, a single
+`event: gap` is emitted instead of the backlog, carrying the true newest
+message id so the consumer can decide how to recover.
+
+tgcli keeps **no subscriber state**: the archive is the durable log and the
+consumer owns its cursor, so reconnecting after a disconnect is the same code
+path as connecting for the first time. Events are published only after a
+message is durably written, and a message arriving mid-replay is delivered
+exactly once.
+
 ## Configuration & Store
 
 The tgcli store lives in the OS app-data directory and contains `config.json`, sessions, and `messages.db`.
