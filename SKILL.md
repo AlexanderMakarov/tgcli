@@ -20,7 +20,7 @@ Use this skill when the user:
 ## Install
 
 ```bash
-npm install -g @kfastov/tgcli
+npm install -g @alexandermakarov/tgcli
 ```
 
 Or:

@@ -5,7 +5,7 @@ Telegram CLI with background sync and an optional MCP server for your personal a
 ## Installation
 
 ```bash
-npm install -g @kfastov/tgcli
+npm install -g @alexandermakarov/tgcli
 ```
 
 ```bash
