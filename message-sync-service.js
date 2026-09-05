@@ -5,6 +5,7 @@ import { setTimeout as delay } from 'timers/promises';
 import { Message, PeersIndex, _messageMediaFromTl } from '@mtcute/core';
 import { normalizeChannelId, summarizeMedia } from './telegram-client.js';
 import { resolveStoreDir, resolveStorePaths } from './core/store.js';
+import { SubscriptionHub } from './core/subscriptions.js';
 
 const DEFAULT_DB_PATH = resolveStorePaths(resolveStoreDir()).dbPath;
 const DEFAULT_TARGET_MESSAGES = 1000;
@@ -545,6 +546,7 @@ export default class MessageSyncService {
     this.realtimeActive = false;
     this.realtimeHandlers = null;
     this.unsubscribeChannelTooLong = null;
+    this.subscriptions = new SubscriptionHub();
 
     this._initDatabase();
   }
@@ -3157,6 +3159,34 @@ export default class MessageSyncService {
     return row.sync_enabled === 1;
   }
 
+  /**
+   * Emit a subscription event for a message that is already in the archive.
+   *
+   * Reads the row back through getArchivedMessage so live and replayed
+   * payloads are identical — otherwise consumers would need two parsers — and
+   * so an event can never describe a message that failed to persist. Never
+   * throws: a subscription problem must not break ingest.
+   */
+  _publishSubscriptionEvent(channelId, messageId, isEdit) {
+    if (!this.subscriptions?.size) {
+      return;
+    }
+    try {
+      const message = this.getArchivedMessage({ channelId, messageId });
+      if (!message) {
+        return;
+      }
+      this.subscriptions.publish({
+        type: isEdit ? 'message.edit' : 'message.new',
+        channelId: String(normalizeChannelKey(channelId)),
+        messageId,
+        message,
+      });
+    } catch (error) {
+      console.error(`[subscriptions] publish failed for ${channelId}/${messageId}: ${error?.message ?? error}`);
+    }
+  }
+
   _handleIncomingMessage(message, { isEdit }) {
     if (!message?.chat?.id) {
       return;
@@ -3194,6 +3224,10 @@ export default class MessageSyncService {
       oldestMessageId: serialized.id,
       oldestMessageDate: messageDate,
     });
+
+    // Last, deliberately: after the insert, the link/media replacement and the
+    // cursor update, so a subscriber never observes a half-written message.
+    this._publishSubscriptionEvent(channelId, serialized.id, isEdit);
   }
 
   _handleDeleteMessage(update) {
