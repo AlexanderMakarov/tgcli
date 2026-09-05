@@ -1,5 +1,20 @@
 # Target MCP Tool Schema (vNext)
 
+> **Note:** this document describes a *target* schema. It does not fully match
+> the tools the server currently registers — for example `syncRealtimeSet` and
+> `channelsSetSync` are described here but are not implemented. Check
+> `mcp-server.js` for the authoritative list.
+
+## HTTP endpoints
+
+Not MCP tools, but served by the same HTTP server:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Liveness probe; returns `{"status":"ok"}`. |
+| `GET /subscribe` | Server-Sent Events stream of new/edited messages. Params: `channels` (required, comma-separated archive-form ids), `types` (`message.new`,`message.edit`), `since` (replay cursor). See README. |
+
+
 This document defines the consolidated MCP tool surface. The goal is fewer tools, consistent filters, and a single API for archive/live/both.
 
 ## Shared types

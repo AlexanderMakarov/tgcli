@@ -20,6 +20,7 @@ import {
 import { readJsonBody } from "./core/http-util.js";
 import { parseDuration } from "./core/duration.js";
 import { OPERATIONS } from "./core/operations.js";
+import { handleSubscribeRequest } from "./core/subscriptions.js";
 
 const SERVICE_STATE_FILE = "service-state.json";
 
@@ -1718,6 +1719,17 @@ if (mcpEnabled) {
         res.writeHead(200, { "Content-Type": "application/json" }).end(
           JSON.stringify({ status: "ok" }),
         );
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/subscribe") {
+        handleSubscribeRequest({
+          req,
+          res,
+          url,
+          hub: messageSyncService.subscriptions,
+          replay: (options) => messageSyncService.listArchivedMessagesSince(options),
+        });
         return;
       }
 
