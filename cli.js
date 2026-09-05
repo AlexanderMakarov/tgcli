@@ -57,7 +57,6 @@ const DEFAULT_SEND_RETRIES = 2;
 const DEFAULT_SEND_TIMEOUT_MS = 30000;
 const FEEDBACK_LAST_FILE = 'feedback-last.json';
 const FEEDBACK_COOLDOWN_MS = 60 * 1000;
-const FEEDBACK_DEFAULT_CHAT_ID = '@kfastov';
 
 const CLI_PROGRAM = buildProgram();
 
@@ -1495,7 +1494,15 @@ async function runFeedback(globalFlags, messageParts, options = {}) {
     try {
       const { config } = loadConfig(storeDir);
       const normalizedConfig = normalizeConfig(config ?? {});
-      const chatId = normalizedConfig.feedback?.chatId || FEEDBACK_DEFAULT_CHAT_ID;
+      // No default recipient. This fork is detached from the original
+      // upstream, so falling back to its author's Telegram would DM someone
+      // unrelated to this code. The recipient must be configured explicitly.
+      const chatId = normalizedConfig.feedback?.chatId;
+      if (!chatId) {
+        throw new Error(
+          'No feedback recipient configured. Set one with `tgcli config set feedback.chatId <@username-or-id>`.',
+        );
+      }
 
             const remainingSeconds = getFeedbackCooldownRemainingSeconds(storeDir);
       if (remainingSeconds > 0) {

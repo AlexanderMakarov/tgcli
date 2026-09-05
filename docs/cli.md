@@ -151,8 +151,9 @@ Legacy `--offset-id` is accepted as a hidden alias for `--before-id`.
 
 ## feedback
 - feedback <message>
-  - Sends feedback directly to the tgcli maintainer (@kfastov) via Telegram.
-  - Override recipient: `tgcli config set feedback.chatId <username-or-id>`
+  - Sends a message to a configured Telegram recipient.
+  - **Requires a recipient:** `tgcli config set feedback.chatId <username-or-id>`. There is no default — this fork is detached from its upstream, so there is no maintainer to route feedback to.
+  - Fails with a clear error if `feedback.chatId` is unset.
   - Rate limited: 1 message per 60 seconds.
   - **What is sent:** your message text, plus a metadata footer containing: tgcli version, OS name (`process.platform`), and Node.js version. No other data (no username, chat history, file paths, or system info) is included. The message is sent from your authenticated Telegram account, so the recipient will see your Telegram profile.
 

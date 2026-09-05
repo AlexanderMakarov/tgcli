@@ -84,22 +84,21 @@ tgcli v2.0.8 | linux | v24.0.0`);
     expect(getFeedbackCooldownRemainingSeconds(storeDir, 1_060_000)).toBe(0);
   });
 
-  it('uses default recipient @kfastov when feedback.chatId is not configured', async () => {
+  it('refuses to send when feedback.chatId is not configured', async () => {
+    // There is deliberately no default recipient: this fork is detached from
+    // its upstream, so a fallback would DM the original author.
     saveConfig(storeDir, {
       apiId: '12345',
       apiHash: 'hash',
       phoneNumber: '+10000000000',
     });
     const { telegramClient } = createMockServices(999);
-    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
 
-    await runFeedback({ json: true, timeoutMs: null }, ['test', 'feedback'], {});
+    await expect(
+      runFeedback({ json: true, timeoutMs: null }, ['test', 'feedback'], {}),
+    ).rejects.toThrow(/feedback\.chatId/);
 
-    expect(telegramClient.sendTextMessage).toHaveBeenCalledWith(
-      '@kfastov',
-      expect.any(String),
-      { parseMode: 'none' },
-    );
+    expect(telegramClient.sendTextMessage).not.toHaveBeenCalled();
   });
 
   it('sends plain-text feedback and returns JSON output', async () => {
