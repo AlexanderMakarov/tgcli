@@ -99,3 +99,132 @@ export function parseSubscribeQuery(searchParams) {
 
   return { ok: true, filter: { channels, types }, since };
 }
+
+/** Write one SSE frame. */
+function writeEvent(res, { type, id, data }) {
+  if (id !== undefined && id !== null) {
+    res.write(`id: ${id}\n`);
+  }
+  res.write(`event: ${type}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+/**
+ * Serve GET /subscribe as Server-Sent Events.
+ *
+ * Ordering is the whole point. The live listener is attached and buffered
+ * BEFORE the archive replay runs; the buffer is then flushed with any id the
+ * replay already sent filtered out. Replaying first and subscribing after
+ * would silently drop every message that arrived in between — precisely the
+ * window a reconnecting consumer is trying to close.
+ */
+export function handleSubscribeRequest({
+  req,
+  res,
+  url,
+  hub,
+  replay,
+  maxReplay = 500,
+  heartbeatMs = 25_000,
+}) {
+  const parsed = parseSubscribeQuery(url.searchParams);
+  if (!parsed.ok) {
+    res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: parsed.error }));
+    return { close() {} };
+  }
+
+  const { filter, since } = parsed;
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+
+  // Node holds headers back until the first body write. A live-only
+  // subscription may not write for hours, which leaves the client's request
+  // promise unresolved and looking like a hang. Flush, then prime the stream
+  // with a comment so intermediaries see bytes immediately.
+  res.flushHeaders?.();
+  res.write(': connected\n\n');
+
+  const sentIds = new Set();
+  let buffered = [];
+  let replaying = true;
+
+  const deliver = (event) => {
+    // An edit re-sends an id the consumer has already seen, by design; only
+    // new-message duplicates from the replay/live overlap are suppressed.
+    if (event.type === 'message.new' && sentIds.has(event.messageId)) {
+      return;
+    }
+    sentIds.add(event.messageId);
+    writeEvent(res, { type: event.type, id: event.messageId, data: event.message });
+  };
+
+  // 1. Attach and buffer FIRST.
+  const unsubscribe = hub.subscribe(filter, (event) => {
+    if (replaying) {
+      buffered.push(event);
+      return;
+    }
+    deliver(event);
+  });
+
+  const heartbeat = setInterval(() => {
+    res.write(': ping\n\n');
+  }, heartbeatMs);
+
+  const close = () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+    if (!res.writableEnded) {
+      res.end();
+    }
+  };
+
+  req.on('close', close);
+  req.on('error', close);
+
+  // 2. Replay, then 3. flush the buffer minus what replay already covered.
+  try {
+    if (since !== null) {
+      const rows = replay({
+        channelIds: [...filter.channels],
+        sinceMessageId: since,
+        limit: maxReplay + 1,
+      });
+
+      if (rows.length > maxReplay) {
+        const newest = rows[rows.length - 1];
+        writeEvent(res, {
+          type: 'gap',
+          data: {
+            reason: 'replay_limit_exceeded',
+            maxReplay,
+            sinceMessageId: since,
+            newestMessageId: newest.messageId,
+          },
+        });
+      } else {
+        for (const row of rows) {
+          sentIds.add(row.messageId);
+          writeEvent(res, { type: 'message.new', id: row.messageId, data: row });
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[subscriptions] replay failed: ${error?.message ?? error}`);
+    writeEvent(res, { type: 'error', data: { message: 'replay failed' } });
+  }
+
+  replaying = false;
+  const pending = buffered;
+  buffered = [];
+  for (const event of pending) {
+    deliver(event);
+  }
+
+  return { close };
+}
