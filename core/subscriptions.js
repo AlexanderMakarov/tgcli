@@ -57,7 +57,18 @@ export class SubscriptionHub {
 }
 
 /**
- * Parse `?channels=&types=&since=` into a filter plus a replay cursor.
+ * Parse `?channels=&types=&since=` into a filter plus per-channel cursors.
+ *
+ * `channels` accepts either a bare id or `id:since` pairs:
+ *
+ *   channels=-1003713035210:158,-5508552085:58605
+ *
+ * Per-channel cursors matter because Telegram message ids are per-chat and can
+ * be wildly disjoint. With one shared cursor, the lowest one wins and every
+ * other channel replays its entire history — which not only wastes bandwidth
+ * but lets one channel consume the whole `maxReplay` budget and starve the
+ * replay of the channel that actually needed it. A bare id falls back to the
+ * global `since`, so older callers keep working.
  *
  * Channel ids are used verbatim. They must be archive-form ("-100…" for
  * supergroups and channels, a plain id for DMs) — the same form
@@ -75,7 +86,28 @@ export function parseSubscribeQuery(searchParams) {
     return { ok: false, error: 'channels is required (comma-separated channel ids)' };
   }
 
-  const channels = new Set(rawChannels);
+  const channels = new Set();
+  const perChannelSince = new Map();
+  for (const entry of rawChannels) {
+    // Split on the LAST colon: ids are negative but never contain a colon,
+    // so this stays correct if an id form ever gains one.
+    const at = entry.lastIndexOf(':');
+    if (at === -1) {
+      channels.add(entry);
+      continue;
+    }
+    const id = entry.slice(0, at).trim();
+    const rawCursor = entry.slice(at + 1).trim();
+    const cursor = Number(rawCursor);
+    if (!id) {
+      return { ok: false, error: `invalid channel entry: ${entry}` };
+    }
+    if (!Number.isInteger(cursor) || cursor < 0) {
+      return { ok: false, error: `cursor for ${id} must be a non-negative integer, got: ${rawCursor}` };
+    }
+    channels.add(id);
+    perChannelSince.set(id, cursor);
+  }
 
   const rawTypes = (searchParams.get('types') ?? '')
     .split(',')
@@ -97,7 +129,7 @@ export function parseSubscribeQuery(searchParams) {
     }
   }
 
-  return { ok: true, filter: { channels, types }, since };
+  return { ok: true, filter: { channels, types }, since, perChannelSince };
 }
 
 /** Write one SSE frame. */
@@ -133,7 +165,7 @@ export function handleSubscribeRequest({
     return { close() {} };
   }
 
-  const { filter, since } = parsed;
+  const { filter, since, perChannelSince } = parsed;
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -149,17 +181,22 @@ export function handleSubscribeRequest({
   res.flushHeaders?.();
   res.write(': connected\n\n');
 
+  // Keyed by channel AND id: message ids are per-chat, so two watched channels
+  // can legitimately carry the same id, and a bare-id key would make one
+  // suppress the other.
   const sentIds = new Set();
+  const sentKey = (channelId, messageId) => `${channelId}:${messageId}`;
   let buffered = [];
   let replaying = true;
 
   const deliver = (event) => {
+    const key = sentKey(event.channelId, event.messageId);
     // An edit re-sends an id the consumer has already seen, by design; only
     // new-message duplicates from the replay/live overlap are suppressed.
-    if (event.type === 'message.new' && sentIds.has(event.messageId)) {
+    if (event.type === 'message.new' && sentIds.has(key)) {
       return;
     }
-    sentIds.add(event.messageId);
+    sentIds.add(key);
     writeEvent(res, { type: event.type, id: event.messageId, data: event.message });
   };
 
@@ -188,11 +225,22 @@ export function handleSubscribeRequest({
   req.on('error', close);
 
   // 2. Replay, then 3. flush the buffer minus what replay already covered.
-  try {
-    if (since !== null) {
+  //
+  // Replay runs PER CHANNEL with that channel's own cursor. A single shared
+  // cursor would replay the whole history of every channel sitting above the
+  // lowest one, and — worse — those discarded rows would eat the maxReplay
+  // budget and starve the replay of the channel that actually needed it. The
+  // budget is therefore per channel, and a gap names the channel it belongs to.
+  for (const channelId of filter.channels) {
+    const channelSince = perChannelSince.has(channelId) ? perChannelSince.get(channelId) : since;
+    if (channelSince === null || channelSince === undefined) {
+      continue; // live-only for this channel
+    }
+
+    try {
       const rows = replay({
-        channelIds: [...filter.channels],
-        sinceMessageId: since,
+        channelIds: [channelId],
+        sinceMessageId: channelSince,
         limit: maxReplay + 1,
       });
 
@@ -202,21 +250,23 @@ export function handleSubscribeRequest({
           type: 'gap',
           data: {
             reason: 'replay_limit_exceeded',
+            channelId,
             maxReplay,
-            sinceMessageId: since,
+            sinceMessageId: channelSince,
             newestMessageId: newest.messageId,
           },
         });
-      } else {
-        for (const row of rows) {
-          sentIds.add(row.messageId);
-          writeEvent(res, { type: 'message.new', id: row.messageId, data: row });
-        }
+        continue;
       }
+
+      for (const row of rows) {
+        sentIds.add(sentKey(channelId, row.messageId));
+        writeEvent(res, { type: 'message.new', id: row.messageId, data: row });
+      }
+    } catch (error) {
+      console.error(`[subscriptions] replay failed for ${channelId}: ${error?.message ?? error}`);
+      writeEvent(res, { type: 'error', data: { message: 'replay failed', channelId } });
     }
-  } catch (error) {
-    console.error(`[subscriptions] replay failed: ${error?.message ?? error}`);
-    writeEvent(res, { type: 'error', data: { message: 'replay failed' } });
   }
 
   replaying = false;

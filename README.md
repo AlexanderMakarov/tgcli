@@ -87,9 +87,17 @@ GET /subscribe?channels=-1003713035210&types=message.new,message.edit&since=154
 
 | Param | Meaning |
 |---|---|
-| `channels` | Comma-separated channel ids. Required. Must be archive-form ids — the same form `listActiveChannels` and `messagesList` return (`-100…` for channels and supergroups, a plain id for DMs). |
+| `channels` | Comma-separated channel ids, optionally each with its own cursor as `id:since`. Required. Must be archive-form ids — the same form `listActiveChannels` and `messagesList` return (`-100…` for channels and supergroups, a plain id for DMs). |
 | `types` | Comma-separated subset of `message.new`, `message.edit`. Defaults to both. |
-| `since` | Last message id already handled. Replays from the archive past it, then streams live. Omit for live-only. |
+| `since` | Default cursor for any channel given as a bare id. Omit for live-only. |
+
+**Prefer per-channel cursors when watching more than one chat:**
+
+```
+GET /subscribe?channels=-1003713035210:158,-5508552085:58605
+```
+
+Telegram message ids are per-chat and can be wildly disjoint — a supergroup at 158 next to a basic group at 58605. With a single shared cursor the lowest one wins, so every other channel replays its entire history. That is not merely wasted bandwidth: those discarded rows count against `maxReplay`, so one channel can consume the whole replay budget and the channel that actually needed catching up gets a `gap` instead of its messages. Per-channel cursors give each channel its own budget, and a `gap` names the `channelId` it belongs to.
 
 ```
 id: 155
@@ -101,9 +109,13 @@ data: {"channelId":"-1003713035210","messageId":155,"date":"…","text":"…"}
 
 The `data` payload is the same shape `messagesList` returns, so one parser
 serves both replay and live. A `: ping` comment every 25s keeps intermediaries
-from idling the connection out. If more than 500 messages are pending, a single
-`event: gap` is emitted instead of the backlog, carrying the true newest
-message id so the consumer can decide how to recover.
+from idling the connection out. If more than 500 messages are pending for a
+channel, a single `event: gap` is emitted for that channel instead of its
+backlog, carrying `channelId` and the true newest message id so the consumer
+can decide how to recover.
+
+Delivery dedup is keyed by channel **and** message id, since ids are per-chat
+and two watched channels can legitimately carry the same one.
 
 tgcli keeps **no subscriber state**: the archive is the durable log and the
 consumer owns its cursor, so reconnecting after a disconnect is the same code
