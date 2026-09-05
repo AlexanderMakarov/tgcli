@@ -32,7 +32,11 @@ import {
 
 const CLI_PATH = fileURLToPath(import.meta.url);
 const SERVICE_STATE_FILE = 'service-state.json';
-const LAUNCHD_LABEL = 'com.kfastov.tgcli';
+// Renaming this orphans an already-installed macOS service: `service
+// uninstall` looks up the plist by label, so an agent installed under the old
+// label must be removed manually (launchctl bootout + delete the plist).
+// Safe here — this is a Linux/systemd deployment with no launchd agent.
+const LAUNCHD_LABEL = 'com.alexandermakarov.tgcli';
 const SYSTEMD_SERVICE_NAME = 'tgcli';
 const AUTH_SYNC_HINT = 'Run `tgcli backfill --once` or `tgcli backfill --follow` when you need archive data.';
 const CONFIG_SPECS = [
