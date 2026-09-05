@@ -9,7 +9,7 @@ npm install -g @alexandermakarov/tgcli
 ```
 
 ```bash
-brew install kfastov/tap/tgcli
+brew install AlexanderMakarov/tap/tgcli
 ```
 
 ## Authentication

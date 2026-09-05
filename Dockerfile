@@ -10,6 +10,6 @@ USER service-user
 
 WORKDIR /app
 
-RUN git clone https://github.com/kfastov/telegram-mcp-server . && git checkout bfac218ea0e2efba7adb73b878171f614785fdde
+RUN git clone https://github.com/AlexanderMakarov/tgcli . && git checkout main
 
 CMD ["mcp-proxy"]
