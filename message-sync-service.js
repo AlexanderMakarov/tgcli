@@ -3515,6 +3515,79 @@ export default class MessageSyncService {
     });
   }
 
+  /**
+   * Bring specific channels' archives level with live before someone reads them.
+   *
+   * The archive is only a durable log if it is complete when a consumer relies
+   * on it. Realtime archiving can miss a stretch — a suspend, a dropped
+   * connection, a CHANNEL_TOO_LONG Telegram never re-announces — and nothing
+   * afterwards necessarily revisits a quiet channel, so the hole persists and a
+   * /subscribe replay walks straight past it.
+   *
+   * Deliberately scoped to the channels the caller names rather than every
+   * synced channel: a subscriber asks for a handful, while an account can have
+   * hundreds, and a sweep of all of them at connect time would be both slow and
+   * a FLOOD_WAIT risk.
+   *
+   * _syncNewerMessages already pages forward from the stored cursor and stops
+   * when a page yields nothing new, so the up-to-date case costs exactly one
+   * live call and writes nothing. It does not publish subscription events, so
+   * anything healed here reaches the consumer through the replay that follows.
+   *
+   * Never throws: a reconcile is an improvement to the replay, not a
+   * precondition for it. A channel that fails is logged and skipped so the
+   * subscription still gets whatever the archive already holds.
+   */
+  async reconcileChannelsAgainstLive(channelIds = [], options = {}) {
+    const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 15_000;
+    const healed = [];
+    const failed = [];
+
+    for (const rawId of channelIds) {
+      const channelId = normalizeChannelKey(rawId);
+      const channel = this._getChannel(channelId);
+      if (!channel || channel.sync_enabled !== 1) {
+        continue;
+      }
+
+      const before = channel.last_message_id || 0;
+      try {
+        await this._withTimeout(this._syncNewerMessages(channelId), timeoutMs, channelId);
+        const after = this._getChannel(channelId)?.last_message_id || 0;
+        if (after > before) {
+          healed.push({ channelId, from: before, to: after });
+          console.log(
+            `[subscribe] reconciled ${channelId}: archive advanced ${before} -> ${after} before replay`,
+          );
+        }
+      } catch (error) {
+        failed.push(channelId);
+        console.warn(
+          `[subscribe] reconcile failed for ${channelId}, replaying the archive as-is:`,
+          error?.message || error,
+        );
+      }
+    }
+
+    return { healed, failed };
+  }
+
+  /**
+   * Bound a catch-up so a stuck Telegram call cannot hold a subscription open
+   * before its replay. The underlying work is not cancellable — it keeps
+   * running and its writes still land — we simply stop waiting on it.
+   */
+  _withTimeout(promise, timeoutMs, label) {
+    let timer = null;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`reconcile timed out after ${timeoutMs}ms`)), timeoutMs);
+      timer.unref?.();
+    });
+    return Promise.race([promise, timeout]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+  }
+
   async _syncNewerMessages(channelId) {
     const normalizedId = normalizeChannelKey(channelId);
     const channel = this._getChannel(normalizedId);

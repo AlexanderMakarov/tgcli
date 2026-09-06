@@ -189,3 +189,73 @@ describe('_handleChannelTooLong retry scope', () => {
     vi.restoreAllMocks();
   });
 });
+
+describe('reconcileChannelsAgainstLive', () => {
+  it('advances a lagging archive and reports what it healed', async () => {
+    seedChannel(MARKED_ID, 158);
+    telegramClient.getMessagesByChannelId
+      .mockResolvedValueOnce({ peerTitle: 'Test Chat', peerType: 'channel', messages: liveMessages([159, 160]) })
+      .mockResolvedValue({ peerTitle: 'Test Chat', peerType: 'channel', messages: [] });
+
+    const result = await service.reconcileChannelsAgainstLive([MARKED_ID]);
+
+    expect(archivedIds(MARKED_ID)).toEqual([159, 160]);
+    expect(result.healed).toEqual([{ channelId: MARKED_ID, from: 158, to: 160 }]);
+    expect(result.failed).toEqual([]);
+  });
+
+  it('reports nothing healed when the archive is already level', async () => {
+    // The common case, and it must cost exactly one live call and no writes.
+    seedChannel(MARKED_ID, 160);
+    telegramClient.getMessagesByChannelId.mockResolvedValue({
+      peerTitle: 'Test Chat', peerType: 'channel', messages: [],
+    });
+
+    const result = await service.reconcileChannelsAgainstLive([MARKED_ID]);
+
+    expect(result.healed).toEqual([]);
+    expect(telegramClient.getMessagesByChannelId).toHaveBeenCalledTimes(1);
+  });
+
+  it('isolates a failing channel so the others still reconcile', async () => {
+    seedChannel(MARKED_ID, 158);
+    seedChannel('-100999', 10);
+    telegramClient.getMessagesByChannelId.mockImplementation(async (channelId) => {
+      if (channelId === MARKED_ID) throw new Error('FLOOD_WAIT_420');
+      return { peerTitle: 'Other', peerType: 'channel', messages: liveMessages([11]) };
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = await service.reconcileChannelsAgainstLive([MARKED_ID, '-100999']);
+
+    expect(result.failed).toEqual([MARKED_ID]);
+    expect(result.healed).toEqual([{ channelId: '-100999', from: 10, to: 11 }]);
+    warn.mockRestore();
+  });
+
+  it('skips a channel that is not synced', async () => {
+    seedChannel(MARKED_ID, 158);
+    service.db.prepare('UPDATE channels SET sync_enabled = 0 WHERE channel_id = ?').run(MARKED_ID);
+
+    await service.reconcileChannelsAgainstLive([MARKED_ID]);
+
+    expect(telegramClient.getMessagesByChannelId).not.toHaveBeenCalled();
+  });
+
+  it('gives up on a stuck channel instead of holding the subscription open', async () => {
+    seedChannel(MARKED_ID, 158);
+    telegramClient.getMessagesByChannelId.mockImplementation(() => new Promise(() => {}));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = await service.reconcileChannelsAgainstLive([MARKED_ID], { timeoutMs: 50 });
+
+    expect(result.failed).toEqual([MARKED_ID]);
+    expect(warn.mock.calls.flat().join(' ')).toContain('timed out');
+    warn.mockRestore();
+  });
+
+  it('never throws, whatever the caller passes', async () => {
+    await expect(service.reconcileChannelsAgainstLive([])).resolves.toEqual({ healed: [], failed: [] });
+    await expect(service.reconcileChannelsAgainstLive(['-100unknown'])).resolves.toEqual({ healed: [], failed: [] });
+  });
+});

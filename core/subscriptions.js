@@ -156,6 +156,7 @@ export function handleSubscribeRequest({
   url,
   hub,
   replay,
+  reconcile = null,
   maxReplay = 500,
   heartbeatMs = 25_000,
 }) {
@@ -224,57 +225,95 @@ export function handleSubscribeRequest({
   req.on('close', close);
   req.on('error', close);
 
-  // 2. Replay, then 3. flush the buffer minus what replay already covered.
+  // 2. Reconcile, 3. replay, 4. flush the buffer minus what replay covered.
   //
+  // The replay below is only as complete as the archive behind it. Realtime
+  // archiving can miss a stretch and nothing necessarily revisits a quiet
+  // channel afterwards, so a hole would be read straight past — the consumer's
+  // cursor advancing over messages it never saw. Reconcile first, and the
+  // replay carries them.
+  //
+  // Safe to await here precisely because step 1 already attached and is
+  // buffering: live events arriving during the reconcile are held, not lost.
+  // Everything from here runs in an async task so the caller still gets its
+  // handle synchronously and can close a subscription mid-reconcile.
+  const replayAll = async () => {
+    if (reconcile) {
+      const channelsToReconcile = [...filter.channels].filter((channelId) => {
+        const channelSince = perChannelSince.has(channelId) ? perChannelSince.get(channelId) : since;
+        return channelSince !== null && channelSince !== undefined;
+      });
+
+      if (channelsToReconcile.length) {
+        try {
+          await reconcile(channelsToReconcile);
+        } catch (error) {
+          // A reconcile is an improvement to the replay, not a precondition.
+          console.error(`[subscriptions] reconcile failed: ${error?.message ?? error}`);
+        }
+      }
+    }
+
+    if (res.writableEnded) {
+      return; // client hung up while we were reconciling
+    }
+
+    replayChannels();
+  };
+
   // Replay runs PER CHANNEL with that channel's own cursor. A single shared
   // cursor would replay the whole history of every channel sitting above the
   // lowest one, and — worse — those discarded rows would eat the maxReplay
   // budget and starve the replay of the channel that actually needed it. The
   // budget is therefore per channel, and a gap names the channel it belongs to.
-  for (const channelId of filter.channels) {
-    const channelSince = perChannelSince.has(channelId) ? perChannelSince.get(channelId) : since;
-    if (channelSince === null || channelSince === undefined) {
-      continue; // live-only for this channel
-    }
+  function replayChannels() {
+    for (const channelId of filter.channels) {
+      const channelSince = perChannelSince.has(channelId) ? perChannelSince.get(channelId) : since;
+      if (channelSince === null || channelSince === undefined) {
+        continue; // live-only for this channel
+      }
 
-    try {
-      const rows = replay({
-        channelIds: [channelId],
-        sinceMessageId: channelSince,
-        limit: maxReplay + 1,
-      });
-
-      if (rows.length > maxReplay) {
-        const newest = rows[rows.length - 1];
-        writeEvent(res, {
-          type: 'gap',
-          data: {
-            reason: 'replay_limit_exceeded',
-            channelId,
-            maxReplay,
-            sinceMessageId: channelSince,
-            newestMessageId: newest.messageId,
-          },
+      try {
+        const rows = replay({
+          channelIds: [channelId],
+          sinceMessageId: channelSince,
+          limit: maxReplay + 1,
         });
-        continue;
-      }
 
-      for (const row of rows) {
-        sentIds.add(sentKey(channelId, row.messageId));
-        writeEvent(res, { type: 'message.new', id: row.messageId, data: row });
+        if (rows.length > maxReplay) {
+          const newest = rows[rows.length - 1];
+          writeEvent(res, {
+            type: 'gap',
+            data: {
+              reason: 'replay_limit_exceeded',
+              channelId,
+              maxReplay,
+              sinceMessageId: channelSince,
+              newestMessageId: newest.messageId,
+            },
+          });
+          continue;
+        }
+
+        for (const row of rows) {
+          sentIds.add(sentKey(channelId, row.messageId));
+          writeEvent(res, { type: 'message.new', id: row.messageId, data: row });
+        }
+      } catch (error) {
+        console.error(`[subscriptions] replay failed for ${channelId}: ${error?.message ?? error}`);
+        writeEvent(res, { type: 'error', data: { message: 'replay failed', channelId } });
       }
-    } catch (error) {
-      console.error(`[subscriptions] replay failed for ${channelId}: ${error?.message ?? error}`);
-      writeEvent(res, { type: 'error', data: { message: 'replay failed', channelId } });
+    }
+
+    replaying = false;
+    const pending = buffered;
+    buffered = [];
+    for (const event of pending) {
+      deliver(event);
     }
   }
 
-  replaying = false;
-  const pending = buffered;
-  buffered = [];
-  for (const event of pending) {
-    deliver(event);
-  }
+  void replayAll();
 
   return { close };
 }
