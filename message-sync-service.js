@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import { setTimeout as delay } from 'timers/promises';
 import { Message, PeersIndex, _messageMediaFromTl } from '@mtcute/core';
+import { toggleChannelIdMark } from '@mtcute/core/utils.js';
 import { normalizeChannelId, summarizeMedia } from './telegram-client.js';
 import { resolveStoreDir, resolveStorePaths } from './core/store.js';
 import { SubscriptionHub } from './core/subscriptions.js';
@@ -2060,7 +2061,12 @@ export default class MessageSyncService {
     };
 
     this.unsubscribeChannelTooLong = this.telegramClient.onChannelTooLong((payload) => {
-      this._handleChannelTooLong(payload);
+      // The handler is async now (it awaits the catch-up). mtcute's emitter does
+      // not await us, so keep the rejection handled here — an insert throwing
+      // synchronously would otherwise surface as an unhandled rejection.
+      void this._handleChannelTooLong(payload).catch((error) => {
+        console.warn('[warning] CHANNEL_TOO_LONG handler failed:', error?.message || error);
+      });
     });
 
     this.realtimeActive = true;
@@ -3364,11 +3370,89 @@ export default class MessageSyncService {
     `).run(...ids);
   }
 
-  _handleChannelTooLong({ channelId, diff }) {
-    if (!diff?.messages?.length) {
+  /**
+   * Telegram could not express the gap as a diff — resync this channel.
+   *
+   * CHANNEL_TOO_LONG means "you are too far behind, start over". The update
+   * carries a handful of recent messages at best and frequently none at all:
+   * mtcute asks for the difference with `channelMessagesFilterEmpty` and a pts
+   * limit, so an empty `messages` is the update's ORDINARY shape, not an edge
+   * case. That is also precisely when a catch-up matters most, so the catch-up
+   * runs whether or not the diff brought anything with it.
+   *
+   * Returns a promise so the catch-up can be awaited in tests and its failure
+   * logged; the realtime handler is sync and fires this without waiting.
+   */
+  async _handleChannelTooLong({ channelId, diff }) {
+    const channelKey = this._resolveTooLongChannelKey(channelId, diff);
+    if (!channelKey) {
+      console.warn('[warning] CHANNEL_TOO_LONG for an unidentifiable channel; skipping catch-up');
       return;
     }
 
+    if (diff?.messages?.length) {
+      this._insertTooLongMessages(channelKey, diff);
+    }
+
+    // The heal itself. Pages forward from the channel's cursor until a page
+    // yields nothing new, so it closes the hole regardless of how far behind
+    // the archive fell. Never fire-and-forget: an unhandled rejection here
+    // leaves a permanent hole with nothing in the logs to explain it.
+    try {
+      await this._syncNewerMessages(channelKey);
+    } catch (error) {
+      console.warn(
+        `[warning] CHANNEL_TOO_LONG catch-up failed for ${channelKey}:`,
+        error?.message || error,
+      );
+      // A half-finished catch-up leaves the hole it was sent to close, and
+      // nothing would come back for it: TooLong fires when Telegram decides to,
+      // which may be never for a quiet channel. Hand it to the job queue, which
+      // already retries, is sequential (so a FLOOD_WAIT does not turn into a
+      // storm), and survives a restart via resumePendingJobs. addJob is
+      // idempotent per channel, so repeated failures coalesce into one job.
+      try {
+        // depth = what is already archived, so _backfillHistory sees
+        // currentCount >= targetCount and returns immediately. The job then
+        // does exactly what failed — sync forward — instead of also dragging in
+        // old history up to the 1000-message default.
+        this.addJob(channelKey, { depth: this._countMessages(channelKey) });
+        void this.processQueue();
+      } catch (queueError) {
+        console.warn(
+          `[warning] could not queue a retry for ${channelKey}:`,
+          queueError?.message || queueError,
+        );
+      }
+    }
+  }
+
+  /**
+   * Which channel does this update belong to, in the form the archive uses?
+   *
+   * Two id forms meet here. mtcute passes the BARE channel id (3713035210),
+   * while every row in `channels` is keyed on the MARKED id (-1003713035210)
+   * that `message.chat.id` and `listDialogs` produce. Looking the archive up by
+   * the bare id finds nothing and returns early — silently, which is
+   * indistinguishable from the bug this whole handler exists to fix.
+   *
+   * The diff's own messages are authoritative when present; otherwise convert.
+   */
+  _resolveTooLongChannelKey(channelId, diff) {
+    for (const rawMessage of diff?.messages ?? []) {
+      if (rawMessage._ === 'messageEmpty') continue;
+      const chatId = new Message(rawMessage, PeersIndex.from(diff)).chat?.id;
+      if (chatId != null) return String(chatId);
+    }
+
+    const numericId = Number(channelId);
+    if (!Number.isFinite(numericId) || numericId === 0) return null;
+    // Bare ids are positive; anything already negative is marked, leave it be.
+    return String(numericId > 0 ? toggleChannelIdMark(numericId) : numericId);
+  }
+
+  /** Archive the recent messages a non-empty TooLong diff happened to carry. */
+  _insertTooLongMessages(fallbackChannelKey, diff) {
     const peers = PeersIndex.from(diff);
     const records = [];
     const userRecords = new Map();
@@ -3383,7 +3467,7 @@ export default class MessageSyncService {
         continue;
       }
       const message = new Message(rawMessage, peers);
-      const channelKey = String(message.chat?.id ?? normalizeChannelKey(channelId));
+      const channelKey = String(message.chat?.id ?? fallbackChannelKey);
       batchChannelId = batchChannelId ?? channelKey;
 
       const channelRow = this._ensureChannelFromPeer(channelKey, message.chat);
@@ -3429,8 +3513,6 @@ export default class MessageSyncService {
       oldestMessageId: oldestMessageId,
       oldestMessageDate: oldestMessageDate,
     });
-
-    void this._syncNewerMessages(batchChannelId);
   }
 
   async _syncNewerMessages(channelId) {
