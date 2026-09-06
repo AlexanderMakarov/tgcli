@@ -275,8 +275,10 @@ describe('/subscribe archive reconciliation', () => {
     const archive = [{ messageId: 158, channelId: '-100777', text: 'old' }];
     const base = await startServer({
       replay: () => archive.filter((row) => row.messageId > 158),
-      reconcile: async (channelIds) => {
-        expect(channelIds).toEqual(['-100777']);
+      reconcile: async (entries) => {
+        // Each entry carries the cursor the replay will start from, not just
+        // the channel id — the archive cursor alone cannot see an interior hole.
+        expect(entries).toEqual([{ channelId: '-100777', sinceMessageId: 158 }]);
         archive.push({ messageId: 159, channelId: '-100777', text: 'healed' });
       },
     });
@@ -309,7 +311,7 @@ describe('/subscribe archive reconciliation', () => {
     const calls = [];
     const base = await startServer({
       replay: () => [],
-      reconcile: async (channelIds) => { calls.push(channelIds); },
+      reconcile: async (entries) => { calls.push(entries); },
     });
 
     const response = await fetch(`${base}/subscribe?channels=-100777`);

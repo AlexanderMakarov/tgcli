@@ -3390,16 +3390,24 @@ export default class MessageSyncService {
       return;
     }
 
-    if (diff?.messages?.length) {
-      this._insertTooLongMessages(channelKey, diff);
-    }
+    // Capture the cursor BEFORE inserting. The diff carries the channel's most
+    // RECENT messages, not the ones we are missing — archiving them first drags
+    // the cursor up to the newest of them, and the catch-up below, which pages
+    // forward from that cursor, then asks Telegram for messages after the gap
+    // instead of across it. Cursor at 100, realtime missed 101-497, diff brings
+    // 498-500: insert-then-sync loses 101-497 permanently.
+    const cursorBeforeDiff = this._getChannel(channelKey)?.last_message_id || 0;
 
-    // The heal itself. Pages forward from the channel's cursor until a page
-    // yields nothing new, so it closes the hole regardless of how far behind
-    // the archive fell. Never fire-and-forget: an unhandled rejection here
-    // leaves a permanent hole with nothing in the logs to explain it.
     try {
-      await this._syncNewerMessages(channelKey);
+      if (diff?.messages?.length) {
+        this._insertTooLongMessages(channelKey, diff);
+      }
+
+      // The heal itself. Pages forward from where the archive actually stopped
+      // until a page yields nothing new, so it closes the hole however far
+      // behind the archive fell. Never fire-and-forget: an unhandled rejection
+      // here leaves a permanent hole with nothing in the logs to explain it.
+      await this._syncNewerMessages(channelKey, { fromMessageId: cursorBeforeDiff });
     } catch (error) {
       console.warn(
         `[warning] CHANNEL_TOO_LONG catch-up failed for ${channelKey}:`,
@@ -3412,12 +3420,24 @@ export default class MessageSyncService {
       // storm), and survives a restart via resumePendingJobs. addJob is
       // idempotent per channel, so repeated failures coalesce into one job.
       try {
-        // depth = what is already archived, so _backfillHistory sees
-        // currentCount >= targetCount and returns immediately. The job then
-        // does exactly what failed — sync forward — instead of also dragging in
-        // old history up to the 1000-message default.
-        this.addJob(channelKey, { depth: this._countMessages(channelKey) });
-        void this.processQueue();
+        // addJob is an upsert keyed on channel, so queueing here would rewrite a
+        // job that already exists — silently shrinking a user's deep backfill to
+        // our own depth, or resetting a row _processJob is about to overwrite
+        // with its terminal status, which would drop this retry entirely.
+        // Anything already pending or running will run the same catch-up.
+        const existing = this.listJobs({ channelId: channelKey })
+          .find((job) => job.status === JOB_STATUS.PENDING || job.status === JOB_STATUS.IN_PROGRESS);
+        if (existing) {
+          console.warn(`[warning] ${channelKey} already has a ${existing.status} job; leaving it to run the catch-up`);
+        } else {
+          // depth = what is already archived, so _backfillHistory sees
+          // currentCount >= targetCount and returns immediately. The job then
+          // does exactly what failed — sync forward — instead of also dragging
+          // in old history up to the 1000-message default. Floor of 1 because
+          // addJob treats a falsy depth as "use the default".
+          this.addJob(channelKey, { depth: Math.max(1, this._countMessages(channelKey)) });
+          void this.processQueue();
+        }
       } catch (queueError) {
         console.warn(
           `[warning] could not queue a retry for ${channelKey}:`,
@@ -3441,8 +3461,15 @@ export default class MessageSyncService {
   _resolveTooLongChannelKey(channelId, diff) {
     for (const rawMessage of diff?.messages ?? []) {
       if (rawMessage._ === 'messageEmpty') continue;
-      const chatId = new Message(rawMessage, PeersIndex.from(diff)).chat?.id;
-      if (chatId != null) return String(chatId);
+      try {
+        const chatId = new Message(rawMessage, PeersIndex.from(diff)).chat?.id;
+        if (chatId != null) return String(chatId);
+      } catch {
+        // A raw message with no peerId, or a peer missing from the diff's
+        // index, makes mtcute throw while resolving `chat`. Fall through to the
+        // id conversion below rather than losing the catch-up entirely.
+        break;
+      }
     }
 
     const numericId = Number(channelId);
@@ -3538,21 +3565,38 @@ export default class MessageSyncService {
    * precondition for it. A channel that fails is logged and skipped so the
    * subscription still gets whatever the archive already holds.
    */
-  async reconcileChannelsAgainstLive(channelIds = [], options = {}) {
+  async reconcileChannelsAgainstLive(entries = [], options = {}) {
     const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 15_000;
+    // One budget for the whole pass, not per channel: a subscriber watching ten
+    // channels against an unresponsive Telegram would otherwise wait ten
+    // timeouts before its first replayed byte.
+    const deadline = Date.now() + (Number.isFinite(options.budgetMs) ? options.budgetMs : 30_000);
     const healed = [];
     const failed = [];
+    const skipped = [];
 
-    for (const rawId of channelIds) {
+    for (const entry of entries) {
+      const rawId = typeof entry === 'object' && entry !== null ? entry.channelId : entry;
+      const sinceMessageId = typeof entry === 'object' && entry !== null ? entry.sinceMessageId : undefined;
       const channelId = normalizeChannelKey(rawId);
       const channel = this._getChannel(channelId);
       if (!channel || channel.sync_enabled !== 1) {
         continue;
       }
 
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        skipped.push(channelId);
+        continue;
+      }
+
       const before = channel.last_message_id || 0;
       try {
-        await this._withTimeout(this._syncNewerMessages(channelId), timeoutMs, channelId);
+        await this._withTimeout(
+          this._reconcileOnce(channelId, sinceMessageId),
+          Math.min(timeoutMs, remaining),
+          channelId,
+        );
         const after = this._getChannel(channelId)?.last_message_id || 0;
         if (after > before) {
           healed.push({ channelId, from: before, to: after });
@@ -3569,7 +3613,40 @@ export default class MessageSyncService {
       }
     }
 
-    return { healed, failed };
+    if (skipped.length) {
+      console.warn(`[subscribe] reconcile budget exhausted; replayed as-is: ${skipped.join(', ')}`);
+    }
+
+    return { healed, failed, skipped };
+  }
+
+  /**
+   * One channel's catch-up, shared between concurrent callers.
+   *
+   * /subscribe reconciles on every connection, so a client in a reconnect loop —
+   * or several clients watching the same channel — would otherwise each issue
+   * their own live call for the same work. That is a FLOOD_WAIT amplifier on
+   * precisely the path meant to survive one. Callers join the in-flight run
+   * instead; the writes are idempotent either way, this saves the API calls.
+   *
+   * Pages from the subscriber's own floor when it names one. The channel cursor
+   * alone only finds a TRAILING lag: if realtime missed 159-160 but then
+   * archived 161, the cursor already sits above the hole and paging from it
+   * would report nothing to do. A subscriber replaying from 158 needs 159-160.
+   */
+  _reconcileOnce(channelId, sinceMessageId) {
+    this._reconcileInFlight ??= new Map();
+    const existing = this._reconcileInFlight.get(channelId);
+    if (existing) {
+      return existing;
+    }
+
+    const run = this._syncNewerMessages(channelId, { fromMessageId: sinceMessageId })
+      .finally(() => {
+        this._reconcileInFlight.delete(channelId);
+      });
+    this._reconcileInFlight.set(channelId, run);
+    return run;
   }
 
   /**
@@ -3580,7 +3657,10 @@ export default class MessageSyncService {
   _withTimeout(promise, timeoutMs, label) {
     let timer = null;
     const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`reconcile timed out after ${timeoutMs}ms`)), timeoutMs);
+      timer = setTimeout(
+        () => reject(new Error(`reconcile for ${label} timed out after ${timeoutMs}ms`)),
+        timeoutMs,
+      );
       timer.unref?.();
     });
     return Promise.race([promise, timeout]).finally(() => {
@@ -3588,14 +3668,20 @@ export default class MessageSyncService {
     });
   }
 
-  async _syncNewerMessages(channelId) {
+  async _syncNewerMessages(channelId, options = {}) {
     const normalizedId = normalizeChannelKey(channelId);
     const channel = this._getChannel(normalizedId);
     if (!channel || channel.sync_enabled !== 1) {
       return { hasMoreNewer: false, stoppedEarly: false };
     }
 
-    let minId = channel.last_message_id || 0;
+    // Callers that know the archive stopped earlier than the cursor suggests —
+    // a TooLong diff having just dragged it forward, or a subscriber replaying
+    // from further back — page from their own floor instead. Inserts are
+    // idempotent, so re-covering ground is wasted calls, never duplicates.
+    let minId = Number.isFinite(options.fromMessageId)
+      ? Math.min(options.fromMessageId, channel.last_message_id || 0)
+      : channel.last_message_id || 0;
     let lastMessageId = channel.last_message_id || 0;
     let lastMessageDate = channel.last_message_date || null;
     let oldestMessageId = channel.oldest_message_id || null;

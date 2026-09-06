@@ -239,10 +239,18 @@ export function handleSubscribeRequest({
   // handle synchronously and can close a subscription mid-reconcile.
   const replayAll = async () => {
     if (reconcile) {
-      const channelsToReconcile = [...filter.channels].filter((channelId) => {
+      // Each channel carries the cursor its replay will start from. The
+      // archive's own cursor is not enough: if realtime missed 159-160 but then
+      // archived 161, the cursor already sits above the hole, and a reconcile
+      // paging from it would find nothing while the replay still skips them.
+      const channelsToReconcile = [];
+      for (const channelId of filter.channels) {
         const channelSince = perChannelSince.has(channelId) ? perChannelSince.get(channelId) : since;
-        return channelSince !== null && channelSince !== undefined;
-      });
+        if (channelSince === null || channelSince === undefined) {
+          continue; // live-only: no replay, so nothing whose completeness matters
+        }
+        channelsToReconcile.push({ channelId, sinceMessageId: channelSince });
+      }
 
       if (channelsToReconcile.length) {
         try {
@@ -313,7 +321,10 @@ export function handleSubscribeRequest({
     }
   }
 
-  void replayAll();
+  void replayAll().catch((error) => {
+    console.error(`[subscriptions] replay failed: ${error?.message ?? error}`);
+    close();
+  });
 
   return { close };
 }

@@ -255,7 +255,146 @@ describe('reconcileChannelsAgainstLive', () => {
   });
 
   it('never throws, whatever the caller passes', async () => {
-    await expect(service.reconcileChannelsAgainstLive([])).resolves.toEqual({ healed: [], failed: [] });
-    await expect(service.reconcileChannelsAgainstLive(['-100unknown'])).resolves.toEqual({ healed: [], failed: [] });
+    await expect(service.reconcileChannelsAgainstLive([]))
+      .resolves.toEqual({ healed: [], failed: [], skipped: [] });
+    await expect(service.reconcileChannelsAgainstLive(['-100unknown']))
+      .resolves.toEqual({ healed: [], failed: [], skipped: [] });
+  });
+});
+
+describe('review fixes', () => {
+  it('pages from the pre-diff cursor, not from the messages the diff carried', async () => {
+    // The diff carries a channel's most RECENT messages, not the missing ones.
+    // Archiving them first drags the cursor to the newest of them, so a
+    // catch-up that pages from the cursor asks for messages AFTER the gap.
+    // Cursor 100, realtime missed 101-497, diff brings 498-500.
+    seedChannel(MARKED_ID, 100);
+    const sync = vi.spyOn(service, '_syncNewerMessages').mockResolvedValue({});
+    vi.spyOn(service, '_insertTooLongMessages').mockImplementation(() => {
+      service._updateChannelCursors(MARKED_ID, { lastMessageId: 500, lastMessageDate: null });
+    });
+
+    await service._handleChannelTooLong({
+      channelId: BARE_ID,
+      diff: { messages: [{ _: 'message', id: 500 }] },
+    });
+
+    expect(sync).toHaveBeenCalledWith(MARKED_ID, { fromMessageId: 100 });
+    vi.restoreAllMocks();
+  });
+
+  it('_syncNewerMessages honours a caller floor below the cursor', async () => {
+    seedChannel(MARKED_ID, 500);
+    telegramClient.getMessagesByChannelId.mockResolvedValue({
+      peerTitle: 'Test Chat', peerType: 'channel', messages: [],
+    });
+
+    await service._syncNewerMessages(MARKED_ID, { fromMessageId: 100 });
+
+    expect(telegramClient.getMessagesByChannelId.mock.calls[0][2]).toEqual({ minId: 100 });
+  });
+
+  it('never pages further forward than the cursor when the floor is above it', async () => {
+    seedChannel(MARKED_ID, 100);
+    telegramClient.getMessagesByChannelId.mockResolvedValue({
+      peerTitle: 'Test Chat', peerType: 'channel', messages: [],
+    });
+
+    await service._syncNewerMessages(MARKED_ID, { fromMessageId: 900 });
+
+    expect(telegramClient.getMessagesByChannelId.mock.calls[0][2]).toEqual({ minId: 100 });
+  });
+
+  it('falls back to the id conversion when a diff message has no resolvable peer', async () => {
+    // mtcute throws building Message.chat for a raw message with no peerId.
+    // That must not escape and cost us the catch-up entirely.
+    seedChannel(MARKED_ID, 100);
+    telegramClient.getMessagesByChannelId.mockResolvedValue({
+      peerTitle: 'Test Chat', peerType: 'channel', messages: [],
+    });
+
+    await service._handleChannelTooLong({
+      channelId: BARE_ID,
+      diff: { messages: [{ _: 'message', id: 500 }] },
+    });
+
+    expect(telegramClient.getMessagesByChannelId).toHaveBeenCalled();
+    expect(telegramClient.getMessagesByChannelId.mock.calls[0][0]).toBe(MARKED_ID);
+  });
+
+  it('leaves an existing queued job alone instead of rewriting its depth', async () => {
+    // addJob is an upsert keyed on channel: queueing over a user's deep
+    // backfill would silently shrink it to our own depth.
+    seedChannel(MARKED_ID, 100);
+    service.addJob(MARKED_ID, { depth: 5000 });
+    telegramClient.getMessagesByChannelId.mockRejectedValue(new Error('FLOOD_WAIT_420'));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await service._handleChannelTooLong({ channelId: BARE_ID, diff: { messages: [] } });
+
+    const jobs = service.listJobs({ channelId: MARKED_ID });
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].target_message_count).toBe(5000);
+    vi.restoreAllMocks();
+  });
+
+  it('never queues a retry with the 1000-message default for an empty channel', async () => {
+    seedChannel(MARKED_ID, 100);          // channel row, but no archived messages
+    telegramClient.getMessagesByChannelId.mockRejectedValue(new Error('FLOOD_WAIT_420'));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await service._handleChannelTooLong({ channelId: BARE_ID, diff: { messages: [] } });
+
+    expect(service.listJobs({ channelId: MARKED_ID })[0].target_message_count).toBe(1);
+    vi.restoreAllMocks();
+  });
+
+  it('reconciles from the subscriber floor so an interior hole is healed', async () => {
+    // Realtime missed 159-160 but then archived 161, so the channel cursor
+    // already sits above the hole. Only the subscriber's own cursor finds it.
+    seedChannel(MARKED_ID, 161);
+    telegramClient.getMessagesByChannelId.mockResolvedValue({
+      peerTitle: 'Test Chat', peerType: 'channel', messages: [],
+    });
+
+    await service.reconcileChannelsAgainstLive([{ channelId: MARKED_ID, sinceMessageId: 158 }]);
+
+    expect(telegramClient.getMessagesByChannelId.mock.calls[0][2]).toEqual({ minId: 158 });
+  });
+
+  it('coalesces concurrent reconciles of the same channel into one live call', async () => {
+    // /subscribe reconciles per connection; a reconnect loop or several
+    // subscribers must not each fire their own call for the same work.
+    seedChannel(MARKED_ID, 100);
+    let resolveCall;
+    telegramClient.getMessagesByChannelId.mockImplementation(
+      () => new Promise((resolve) => { resolveCall = () => resolve({ peerTitle: 'C', peerType: 'channel', messages: [] }); }),
+    );
+
+    const first = service.reconcileChannelsAgainstLive([MARKED_ID]);
+    const second = service.reconcileChannelsAgainstLive([MARKED_ID]);
+    await new Promise((r) => setTimeout(r, 10));
+    resolveCall();
+    await Promise.all([first, second]);
+
+    expect(telegramClient.getMessagesByChannelId).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops reconciling when the overall budget runs out', async () => {
+    // One budget for the pass, not one per channel: ten stuck channels must not
+    // mean ten timeouts before the first replayed byte.
+    seedChannel(MARKED_ID, 100);
+    seedChannel('-100999', 10);
+    telegramClient.getMessagesByChannelId.mockImplementation(() => new Promise(() => {}));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = await service.reconcileChannelsAgainstLive([MARKED_ID, '-100999'], {
+      timeoutMs: 5_000,
+      budgetMs: 60,
+    });
+
+    expect(result.failed).toEqual([MARKED_ID]);
+    expect(result.skipped).toEqual(['-100999']);
+    vi.restoreAllMocks();
   });
 });
