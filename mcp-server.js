@@ -1729,6 +1729,11 @@ if (mcpEnabled) {
           url,
           hub: messageSyncService.subscriptions,
           replay: (options) => messageSyncService.listArchivedMessagesSince(options),
+          // Level the archive with live before replaying it, for the channels
+          // this subscriber actually asked for. Without it a hole left by a
+          // missed realtime stretch is read straight past and the consumer's
+          // cursor advances over messages it never saw.
+          reconcile: (channelIds) => messageSyncService.reconcileChannelsAgainstLive(channelIds),
         });
         return;
       }

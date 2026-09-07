@@ -13,7 +13,7 @@ afterEach(async () => {
 });
 
 /** Start a server whose only route is /subscribe, and return its base URL. */
-async function startServer({ replay = () => [], maxReplay = 500 } = {}) {
+async function startServer({ replay = () => [], maxReplay = 500, reconcile = null } = {}) {
   hub = new SubscriptionHub();
   server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -23,6 +23,7 @@ async function startServer({ replay = () => [], maxReplay = 500 } = {}) {
       url,
       hub,
       replay,
+      reconcile,
       maxReplay,
       heartbeatMs: 50_000,
     });
@@ -264,5 +265,91 @@ describe('per-channel cursors', () => {
 
     const events = await readEvents(response, 2);
     expect(events.map(e => e.data.messageId)).toEqual([7, 8]);
+  });
+});
+
+describe('/subscribe archive reconciliation', () => {
+  it('reconciles before replaying, so a healed message is delivered', async () => {
+    // The failure this exists for: realtime missed 159, the archive stopped at
+    // 158, and the replay walked past it while the consumer's cursor advanced.
+    const archive = [{ messageId: 158, channelId: '-100777', text: 'old' }];
+    const base = await startServer({
+      replay: () => archive.filter((row) => row.messageId > 158),
+      reconcile: async (entries) => {
+        // Each entry carries the cursor the replay will start from, not just
+        // the channel id — the archive cursor alone cannot see an interior hole.
+        expect(entries).toEqual([{ channelId: '-100777', sinceMessageId: 158 }]);
+        archive.push({ messageId: 159, channelId: '-100777', text: 'healed' });
+      },
+    });
+
+    const response = await fetch(`${base}/subscribe?channels=-100777:158`);
+    const events = await readEvents(response, 1);
+
+    expect(events).toHaveLength(1);
+    expect(events[0].data.messageId).toBe(159);
+    expect(events[0].data.text).toBe('healed');
+  });
+
+  it('replays the archive as-is when reconcile fails', async () => {
+    // A reconcile is an improvement to the replay, never a precondition for it.
+    const base = await startServer({
+      replay: () => [{ messageId: 159, channelId: '-100777', text: 'archived' }],
+      reconcile: async () => { throw new Error('tgcli unreachable'); },
+    });
+
+    const response = await fetch(`${base}/subscribe?channels=-100777:158`);
+    const events = await readEvents(response, 1);
+
+    expect(events).toHaveLength(1);
+    expect(events[0].data.messageId).toBe(159);
+  });
+
+  it('does not reconcile a live-only channel', async () => {
+    // No cursor means the consumer never asked for history, so there is no
+    // replay whose completeness a live call could improve.
+    const calls = [];
+    const base = await startServer({
+      replay: () => [],
+      reconcile: async (entries) => { calls.push(entries); },
+    });
+
+    const response = await fetch(`${base}/subscribe?channels=-100777`);
+    const reader = response.body.getReader();
+    await reader.read();                       // ': connected'
+    hub.publish({ type: 'message.new', channelId: '-100777', messageId: 5, message: { messageId: 5 } });
+    await reader.read();
+    await reader.cancel();
+
+    expect(calls).toEqual([]);
+  });
+
+  it('holds live events arriving during a slow reconcile rather than dropping them', async () => {
+    // Step 1 attaches and buffers before the reconcile is awaited; that is what
+    // makes awaiting here safe.
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const base = await startServer({
+      replay: () => [],
+      reconcile: async () => { await gate; },
+    });
+
+    const response = await fetch(`${base}/subscribe?channels=-100777:0`);
+    const reader = response.body.getReader();
+    await reader.read();                       // ': connected'
+
+    hub.publish({ type: 'message.new', channelId: '-100777', messageId: 42, message: { messageId: 42 } });
+    release();
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (!buffer.includes('data:')) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+    }
+    await reader.cancel();
+
+    expect(buffer).toContain('"messageId":42');
   });
 });
