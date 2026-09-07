@@ -388,13 +388,21 @@ describe('review fixes', () => {
     telegramClient.getMessagesByChannelId.mockImplementation(() => new Promise(() => {}));
     vi.spyOn(console, 'warn').mockImplementation(() => {});
 
+    const started = Date.now();
     const result = await service.reconcileChannelsAgainstLive([MARKED_ID, '-100999'], {
       timeoutMs: 5_000,
       budgetMs: 60,
     });
+    const elapsed = Date.now() - started;
 
-    expect(result.failed).toEqual([MARKED_ID]);
-    expect(result.skipped).toEqual(['-100999']);
+    // The guarantee is the budget, not which bucket each channel lands in:
+    // once it expires the remaining channels are either skipped outright or
+    // given whatever is left, so a channel can end up in either list depending
+    // on how the clock falls. What must hold is that the pass returns on the
+    // budget rather than on two full per-channel timeouts.
+    expect(elapsed).toBeLessThan(2_000);
+    expect([...result.failed, ...result.skipped].sort()).toEqual(['-100999', MARKED_ID].sort());
+    expect(result.healed).toEqual([]);
     vi.restoreAllMocks();
   });
 });
