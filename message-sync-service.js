@@ -198,6 +198,24 @@ function normalizeChannelKey(channelId) {
   return String(normalizeChannelId(channelId));
 }
 
+/**
+ * Drop the placeholder title Telegram lookups substitute for an unresolved peer.
+ *
+ * `getMessagesByChannelId` and `listDialogs` both return `displayName ||
+ * 'Unknown'`, and that string is truthy, so writing it through the channel
+ * upsert replaces a name we already know with a placeholder. Returning null
+ * instead leaves the stored title alone (the upsert COALESCEs), and a later
+ * lookup that does resolve the peer still updates it.
+ *
+ * A chat genuinely named "Unknown" therefore never has its title refreshed,
+ * which costs nothing but a stale display string.
+ */
+function normalizeIncomingTitle(title) {
+  if (typeof title !== 'string') return null;
+  const trimmed = title.trim();
+  return trimmed && trimmed !== 'Unknown' ? trimmed : null;
+}
+
 function normalizePeerType(peer) {
   if (!peer) return 'chat';
   if (peer.type === 'user' || peer.type === 'bot') return 'user';
@@ -916,7 +934,7 @@ export default class MessageSyncService {
       INSERT INTO channels (channel_id, peer_title, peer_type, chat_type, is_forum, username, updated_at)
       VALUES (@channel_id, @peer_title, @peer_type, @chat_type, @is_forum, @username, CURRENT_TIMESTAMP)
       ON CONFLICT(channel_id) DO UPDATE SET
-        peer_title = excluded.peer_title,
+        peer_title = COALESCE(excluded.peer_title, channels.peer_title),
         peer_type = COALESCE(excluded.peer_type, channels.peer_type),
         chat_type = COALESCE(excluded.chat_type, channels.chat_type),
         is_forum = COALESCE(excluded.is_forum, channels.is_forum),
@@ -1258,7 +1276,7 @@ export default class MessageSyncService {
       for (const dialog of items) {
         this.upsertChannelStmt.get({
           channel_id: String(dialog.id),
-          peer_title: dialog.title ?? null,
+          peer_title: normalizeIncomingTitle(dialog.title),
           peer_type: dialog.type ?? null,
           chat_type: dialog.chatType ?? null,
           is_forum: typeof dialog.isForum === 'boolean' ? (dialog.isForum ? 1 : 0) : null,
@@ -3757,10 +3775,11 @@ export default class MessageSyncService {
       await delay(this.interBatchDelayMs);
     }
 
-    if (peerTitle || peerType) {
+    const resolvedTitle = normalizeIncomingTitle(peerTitle);
+    if (resolvedTitle || peerType) {
       this.upsertChannelStmt.get({
         channel_id: normalizedId,
-        peer_title: peerTitle ?? null,
+        peer_title: resolvedTitle,
         peer_type: peerType ?? null,
         chat_type: null,
         is_forum: null,

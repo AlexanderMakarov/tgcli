@@ -406,3 +406,44 @@ describe('review fixes', () => {
     vi.restoreAllMocks();
   });
 });
+
+describe('channel title preservation', () => {
+  it('does not overwrite a known title with the Unknown placeholder', async () => {
+    // Telegram lookups return `displayName || 'Unknown'`, and that string is
+    // truthy. Since the reconcile runs _syncNewerMessages on every /subscribe,
+    // an unresolved peer would rewrite the real title on every connection.
+    service.db.prepare(`
+      INSERT INTO channels (channel_id, peer_title, peer_type, sync_enabled, last_message_id)
+      VALUES (?, '1-1 դասարան_Էվրիկա', 'channel', 1, 100)
+    `).run(MARKED_ID);
+    telegramClient.getMessagesByChannelId.mockResolvedValue({
+      peerTitle: 'Unknown', peerType: 'channel', messages: [],
+    });
+
+    await service._syncNewerMessages(MARKED_ID);
+
+    expect(service._getChannel(MARKED_ID).peer_title).toBe('1-1 դասարան_Էվրիկա');
+  });
+
+  it('still applies a real title, including a rename', async () => {
+    seedChannel(MARKED_ID, 100);
+    telegramClient.getMessagesByChannelId.mockResolvedValue({
+      peerTitle: 'Renamed Chat', peerType: 'channel', messages: [],
+    });
+
+    await service._syncNewerMessages(MARKED_ID);
+
+    expect(service._getChannel(MARKED_ID).peer_title).toBe('Renamed Chat');
+  });
+
+  it('keeps the stored title when a dialog refresh cannot resolve the peer', async () => {
+    service.db.prepare(`
+      INSERT INTO channels (channel_id, peer_title, peer_type, sync_enabled)
+      VALUES (?, 'Real Title', 'channel', 1)
+    `).run(MARKED_ID);
+
+    service.upsertChannels([{ id: MARKED_ID, title: 'Unknown', type: 'channel' }]);
+
+    expect(service._getChannel(MARKED_ID).peer_title).toBe('Real Title');
+  });
+});
