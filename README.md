@@ -108,7 +108,10 @@ data: {"channelId":"-1003713035210","messageId":155,"date":"…","text":"…"}
 ```
 
 The `data` payload is the same shape `messagesList` returns, so one parser
-serves both replay and live. A `: ping` comment every 25s keeps intermediaries
+serves both replay and live. It carries `editDate` (ISO) beside `date`, so a
+`message.edit` event says *when* it was edited rather than only when it was
+posted; `editDate` is `null` for a message nobody has edited, and for messages
+archived before tgcli started recording it. A `: ping` comment every 25s keeps intermediaries
 from idling the connection out. If more than 500 messages are pending for a
 channel, a single `event: gap` is emitted for that channel instead of its
 backlog, carrying `channelId` and the true newest message id so the consumer

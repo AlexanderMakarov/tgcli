@@ -270,6 +270,9 @@ function formatArchivedRow(row) {
     username: row.username ?? null,
     messageId: row.message_id,
     date: row.date ? new Date(row.date * 1000).toISOString() : null,
+    // Null for a message nobody has edited — never a copy of `date`, so a
+    // consumer can tell "unedited" from "edited the moment it was posted".
+    editDate: row.edit_date ? new Date(row.edit_date * 1000).toISOString() : null,
     fromId: row.from_id ?? null,
     fromUsername: row.from_username ?? null,
     fromDisplayName: row.from_display_name ?? null,
@@ -720,6 +723,7 @@ export default class MessageSyncService {
         message_id INTEGER NOT NULL,
         topic_id INTEGER,
         date INTEGER,
+        edit_date INTEGER,
         from_id TEXT,
         text TEXT,
         links TEXT,
@@ -733,6 +737,7 @@ export default class MessageSyncService {
     `);
 
     this._ensureMessageColumn('topic_id', 'INTEGER');
+    this._ensureMessageColumn('edit_date', 'INTEGER');
     this._ensureMessageColumn('links', 'TEXT');
     this._ensureMessageColumn('files', 'TEXT');
     this._ensureMessageColumn('sender', 'TEXT');
@@ -1039,6 +1044,7 @@ export default class MessageSyncService {
         message_id,
         topic_id,
         date,
+        edit_date,
         from_id,
         text,
         links,
@@ -1052,6 +1058,7 @@ export default class MessageSyncService {
         @message_id,
         @topic_id,
         @date,
+        @edit_date,
         @from_id,
         @text,
         @links,
@@ -1068,6 +1075,7 @@ export default class MessageSyncService {
         message_id,
         topic_id,
         date,
+        edit_date,
         from_id,
         text,
         links,
@@ -1081,6 +1089,7 @@ export default class MessageSyncService {
         @message_id,
         @topic_id,
         @date,
+        @edit_date,
         @from_id,
         @text,
         @links,
@@ -1092,6 +1101,7 @@ export default class MessageSyncService {
       ON CONFLICT(channel_id, message_id) DO UPDATE SET
         topic_id = excluded.topic_id,
         date = excluded.date,
+        edit_date = excluded.edit_date,
         from_id = excluded.from_id,
         text = excluded.text,
         links = excluded.links,
@@ -2279,6 +2289,7 @@ export default class MessageSyncService {
         channels.username,
         messages.message_id,
         messages.date,
+        messages.edit_date,
         messages.from_id,
         messages.text,
         messages.topic_id,
@@ -2325,6 +2336,7 @@ export default class MessageSyncService {
         channels.username,
         messages.message_id,
         messages.date,
+        messages.edit_date,
         messages.from_id,
         messages.text,
         messages.topic_id,
@@ -2355,6 +2367,7 @@ export default class MessageSyncService {
         channels.username,
         messages.message_id,
         messages.date,
+        messages.edit_date,
         messages.from_id,
         messages.text,
         messages.topic_id,
@@ -2395,6 +2408,7 @@ export default class MessageSyncService {
             channels.username,
             messages.message_id,
             messages.date,
+            messages.edit_date,
             messages.from_id,
             messages.text,
             messages.topic_id,
@@ -2421,6 +2435,7 @@ export default class MessageSyncService {
             channels.username,
             messages.message_id,
             messages.date,
+            messages.edit_date,
             messages.from_id,
             messages.text,
             messages.topic_id,
@@ -2528,6 +2543,7 @@ export default class MessageSyncService {
         channels.username,
         messages.message_id,
         messages.date,
+        messages.edit_date,
         messages.from_id,
         messages.text,
         messages.topic_id,
@@ -3097,6 +3113,7 @@ export default class MessageSyncService {
       message_id: message.id,
       topic_id: message.topic_id ?? null,
       date: message.date ?? null,
+      edit_date: message.edit_date ?? null,
       from_id: message.from_id ?? null,
       text: message.text ?? null,
       links: searchFields.linksText,
