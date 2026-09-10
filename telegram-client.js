@@ -1466,6 +1466,16 @@ class TelegramClient {
       dateSeconds = Math.floor(message.date);
     }
 
+    // An edit time is a separate fact from a post time: only the former says
+    // whether the text you are looking at is the current one. mtcute exposes it
+    // as `editDate`, null for a message nobody has ever edited.
+    let editDateSeconds = null;
+    if (message.editDate instanceof Date) {
+      editDateSeconds = Math.floor(message.editDate.getTime() / 1000);
+    } else if (typeof message.editDate === 'number') {
+      editDateSeconds = Math.floor(message.editDate);
+    }
+
     let textContent = '';
     if (typeof message.text === 'string') {
       textContent = message.text;
@@ -1521,6 +1531,7 @@ class TelegramClient {
     return {
       id,
       date: dateSeconds,
+      edit_date: editDateSeconds,
       message: textContent,
       text: textContent,
       urls: urls.length > 0 ? urls : null,
