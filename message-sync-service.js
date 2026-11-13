@@ -2986,9 +2986,9 @@ export default class MessageSyncService {
     });
 
     this.unsubscribeChannelTooLong = this.telegramClient.onChannelTooLong((payload) => {
-      // The handler is async now (it awaits the catch-up). mtcute's emitter does
-      // not await us, so keep the rejection handled here — an insert throwing
-      // synchronously would otherwise surface as an unhandled rejection.
+      // The handler is async; mtcute's emitter does not await us, so keep the
+      // rejection handled here — an insert throwing would otherwise surface as
+      // an unhandled rejection.
       void this._handleChannelTooLong(payload).catch((error) => {
         console.warn('[warning] CHANNEL_TOO_LONG handler failed:', error?.message || error);
       });
@@ -5329,10 +5329,10 @@ export default class MessageSyncService {
     // A recorded gap starts below the cursor. Any sync of the channel fills it.
     const fillingGap = channel.gap_after_message_id !== null;
     let lastMessageId = fillingGap ? channel.gap_after_message_id : (channel.last_message_id || 0);
-    // Callers that know the archive stopped earlier than the cursor suggests (a
-    // TooLong diff that just dragged it forward, a subscriber replaying from
-    // further back) page from their own floor. Inserts are idempotent.
-    if (Number.isFinite(options.fromMessageId)) {
+    // A subscriber replaying from further back than the cursor pages from its own
+    // floor; inserts are idempotent. Only a positive floor: the client reads
+    // afterId 0 as "the newest page", which would skip a recorded gap and close it.
+    if (Number.isFinite(options.fromMessageId) && options.fromMessageId > 0) {
       lastMessageId = Math.min(lastMessageId, options.fromMessageId);
     }
     let cursorBeforeLastPage = channel.last_message_id;
