@@ -55,6 +55,7 @@ tgcli metadata       Channel metadata cache
 tgcli contacts       Contacts and people
 tgcli groups         Group management
 tgcli doctor         Diagnostics and sanity checks
+tgcli store          Local archive maintenance (compact)
 ```
 
 Use `tgcli [command] --help` for details. Add `--json` for machine-readable output.
@@ -130,5 +131,17 @@ exactly once.
 
 The tgcli store lives in the OS app-data directory and contains `config.json`, sessions, and `messages.db`.
 Override the location with `TGCLI_STORE`.
+
+### Shrinking `messages.db`
+
+Each archived message keeps the full Telegram payload in `messages.raw_json`. Stores created before the compact `raw_json` format hold it about 1.5x larger than needed (binary fields were written as `{"0":1,"1":24,…}` index maps). Rewrite them once and return the space to the OS:
+
+```bash
+tgcli service stop        # compaction needs exclusive access to the store
+tgcli store compact       # rewrites raw_json in batches, then VACUUMs
+tgcli service start
+```
+
+`VACUUM` needs free disk of up to about twice the remaining data; the command checks this before starting. Use `--no-vacuum` to only rewrite rows. Expect a few minutes per million messages.
 
 Legacy version: see `MIGRATION.md`.
