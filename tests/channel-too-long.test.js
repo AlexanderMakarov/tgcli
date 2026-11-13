@@ -54,10 +54,35 @@ function liveMessages(ids) {
   return ids.map(id => ({ id, date: 1757000000 + id, text: `msg ${id}`, from: { id: 1 } }));
 }
 
+function recordedGap(channelId) {
+  return service._getChannel(channelId)?.gap_after_message_id ?? null;
+}
+
+// What the queue does for a recorded gap; run inline so tests stay deterministic.
+async function fillGap(channelId = MARKED_ID) {
+  await service._syncNewerMessages(channelId);
+}
+
+/**
+ * The handler records a gap at the cursor and wakes the queue, which fills it.
+ * The end-to-end case (a diff that carries the newest messages) is covered in
+ * telegram-connection.test.js: "fills the gap between the cursor and the
+ * messages the diff carried".
+ */
 describe('_handleChannelTooLong', () => {
-  it('runs the catch-up when the diff carries no messages', async () => {
-    // The bug: this is CHANNEL_TOO_LONG's common shape, and it is precisely
-    // when a full resync is most needed.
+  let processQueue;
+
+  beforeEach(() => {
+    processQueue = vi.spyOn(service, 'processQueue').mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('records a gap when the diff carries no messages, and the fill archives what was missed', async () => {
+    // An empty diff is CHANNEL_TOO_LONG's common shape, and precisely when a
+    // resync is most needed.
     seedChannel(MARKED_ID, 100);
     telegramClient.getMessagesByChannelId
       .mockResolvedValueOnce({ peerTitle: 'Test Chat', peerType: 'channel', messages: liveMessages([101, 102, 103]) })
@@ -65,39 +90,45 @@ describe('_handleChannelTooLong', () => {
 
     await service._handleChannelTooLong({ channelId: BARE_ID, diff: { messages: [] } });
 
+    expect(recordedGap(MARKED_ID)).toBe(100);
+    expect(processQueue).toHaveBeenCalled();
+
+    await fillGap();
+
     expect(archivedIds(MARKED_ID)).toEqual([101, 102, 103]);
+    expect(recordedGap(MARKED_ID)).toBeNull();
   });
 
   it('addresses the archive by its marked channel id, not the bare update id', async () => {
-    // A catch-up keyed on the bare id finds no channel row and returns early —
-    // silently, which is indistinguishable from the bug it is meant to fix.
+    // A gap keyed on the bare id finds no channel row and is silently lost.
     seedChannel(MARKED_ID, 100);
     telegramClient.getMessagesByChannelId
       .mockResolvedValueOnce({ peerTitle: 'Test Chat', peerType: 'channel', messages: liveMessages([101]) })
       .mockResolvedValue({ peerTitle: 'Test Chat', peerType: 'channel', messages: [] });
 
     await service._handleChannelTooLong({ channelId: BARE_ID, diff: { messages: [] } });
+    await fillGap();
 
-    expect(telegramClient.getMessagesByChannelId).toHaveBeenCalled();
     expect(telegramClient.getMessagesByChannelId.mock.calls[0][0]).toBe(MARKED_ID);
     expect(service._getChannel(MARKED_ID).last_message_id).toBe(101);
   });
 
-  it('advances the cursor so the next catch-up does not refetch', async () => {
+  it('advances the cursor so the next fill does not refetch', async () => {
     seedChannel(MARKED_ID, 100);
     telegramClient.getMessagesByChannelId
       .mockResolvedValueOnce({ peerTitle: 'Test Chat', peerType: 'channel', messages: liveMessages([101, 102]) })
       .mockResolvedValue({ peerTitle: 'Test Chat', peerType: 'channel', messages: [] });
 
     await service._handleChannelTooLong({ channelId: BARE_ID, diff: { messages: [] } });
+    await fillGap();
 
     expect(service._getChannel(MARKED_ID).last_message_id).toBe(102);
-    // The first page starts from the stored cursor, not from zero.
-    expect(telegramClient.getMessagesByChannelId.mock.calls[0][2]).toEqual({ minId: 100 });
+    expect(telegramClient.getMessagesByChannelId.mock.calls[0][2]).toEqual({ afterId: 100 });
 
-    // A second TooLong resumes from the advanced cursor rather than refetching.
     await service._handleChannelTooLong({ channelId: BARE_ID, diff: { messages: [] } });
-    expect(telegramClient.getMessagesByChannelId.mock.calls.at(-1)[2]).toEqual({ minId: 102 });
+    await fillGap();
+
+    expect(telegramClient.getMessagesByChannelId.mock.calls.at(-1)[2]).toEqual({ afterId: 102 });
     expect(archivedIds(MARKED_ID)).toEqual([101, 102]);
   });
 
@@ -107,86 +138,55 @@ describe('_handleChannelTooLong', () => {
 
     await service._handleChannelTooLong({ channelId: BARE_ID, diff: { messages: [] } });
 
-    expect(telegramClient.getMessagesByChannelId).not.toHaveBeenCalled();
+    expect(recordedGap(MARKED_ID)).toBeNull();
+    expect(processQueue).not.toHaveBeenCalled();
   });
 
-  it('does not reject when the catch-up fails, and says so', async () => {
-    // Fire-and-forget swallowed this; an unhandled rejection can take the
-    // process down and leaves the hole with nothing in the logs.
-    seedChannel(MARKED_ID, 100);
-    telegramClient.getMessagesByChannelId.mockRejectedValue(new Error('FLOOD_WAIT_420'));
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-
-    await expect(
-      service._handleChannelTooLong({ channelId: BARE_ID, diff: { messages: [] } }),
-    ).resolves.toBeUndefined();
-
-    expect(warn).toHaveBeenCalled();
-    expect(warn.mock.calls.flat().join(' ')).toContain('FLOOD_WAIT_420');
-    warn.mockRestore();
-  });
-});
-
-describe('_handleChannelTooLong retry', () => {
-  it('queues a durable retry when the catch-up dies partway', async () => {
-    // TooLong fires when Telegram decides to — possibly never again for a quiet
-    // channel — so a failed catch-up must leave something behind that will run.
-    seedChannel(MARKED_ID, 100);
-    telegramClient.getMessagesByChannelId.mockRejectedValue(new Error('FLOOD_WAIT_420'));
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  it('records no gap for a chat with no cursor yet', async () => {
+    // Nothing archived means nothing to fill; history is backfill's job.
+    seedChannel(MARKED_ID, 0);
 
     await service._handleChannelTooLong({ channelId: BARE_ID, diff: { messages: [] } });
 
-    const jobs = service.listJobs({ channelId: MARKED_ID });
-    expect(jobs).toHaveLength(1);
-    // Either still queued or already claimed by the queue loop — both mean the
-    // retry is live. What matters is that something exists to run it.
-    expect(['pending', 'in_progress']).toContain(jobs[0].status);
-    vi.restoreAllMocks();
+    expect(recordedGap(MARKED_ID)).toBeNull();
+    expect(processQueue).not.toHaveBeenCalled();
   });
 
-  it('coalesces repeated failures into one job rather than a queue of them', async () => {
+  it('keeps the gap when the fill fails, so the queue retries it', async () => {
+    // TooLong fires when Telegram decides to, possibly never again for a quiet
+    // channel, so a failed fill must leave something durable behind.
     seedChannel(MARKED_ID, 100);
     telegramClient.getMessagesByChannelId.mockRejectedValue(new Error('FLOOD_WAIT_420'));
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await service._handleChannelTooLong({ channelId: BARE_ID, diff: { messages: [] } });
+    await fillGap().catch(() => {});
+
+    expect(recordedGap(MARKED_ID)).toBe(100);
+  });
+
+  it('keeps one gap at the first cursor across repeated TooLongs', async () => {
+    seedChannel(MARKED_ID, 100);
 
     for (let i = 0; i < 5; i += 1) {
       await service._handleChannelTooLong({ channelId: BARE_ID, diff: { messages: [] } });
     }
 
-    expect(service.listJobs({ channelId: MARKED_ID })).toHaveLength(1);
-    vi.restoreAllMocks();
-  });
-
-  it('queues nothing when the catch-up succeeds', async () => {
-    seedChannel(MARKED_ID, 100);
-    telegramClient.getMessagesByChannelId
-      .mockResolvedValueOnce({ peerTitle: 'Test Chat', peerType: 'channel', messages: liveMessages([101]) })
-      .mockResolvedValue({ peerTitle: 'Test Chat', peerType: 'channel', messages: [] });
-
-    await service._handleChannelTooLong({ channelId: BARE_ID, diff: { messages: [] } });
-
+    expect(recordedGap(MARKED_ID)).toBe(100);
     expect(service.listJobs({ channelId: MARKED_ID })).toHaveLength(0);
   });
-});
 
-describe('_handleChannelTooLong retry scope', () => {
-  it('scopes the retry to syncing forward, not backfilling old history', async () => {
-    // The queue's default depth is 1000 messages; a channel below that would
-    // otherwise have the retry drag in history nobody asked for.
+  it('falls back to the id conversion when a diff message has no resolvable peer', async () => {
+    // mtcute throws building Message.chat for a raw message with no peerId.
+    // That must not cost us the gap.
     seedChannel(MARKED_ID, 100);
-    service.db.prepare(`
-      INSERT INTO messages (channel_id, message_id, date, from_id, text, topic_id)
-      VALUES (?, 100, 1757000100, '1', 'only one', NULL)
-    `).run(MARKED_ID);
-    telegramClient.getMessagesByChannelId.mockRejectedValue(new Error('FLOOD_WAIT_420'));
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    await service._handleChannelTooLong({ channelId: BARE_ID, diff: { messages: [] } });
+    await service._handleChannelTooLong({
+      channelId: BARE_ID,
+      diff: { messages: [{ _: 'message', id: 500 }] },
+    });
 
-    const job = service.listJobs({ channelId: MARKED_ID })[0];
-    expect(job.target_message_count).toBe(1);   // == archived count, not 1000
-    vi.restoreAllMocks();
+    expect(recordedGap(MARKED_ID)).toBe(100);
+    expect(processQueue).toHaveBeenCalled();
   });
 });
 
@@ -263,26 +263,6 @@ describe('reconcileChannelsAgainstLive', () => {
 });
 
 describe('review fixes', () => {
-  it('pages from the pre-diff cursor, not from the messages the diff carried', async () => {
-    // The diff carries a channel's most RECENT messages, not the missing ones.
-    // Archiving them first drags the cursor to the newest of them, so a
-    // catch-up that pages from the cursor asks for messages AFTER the gap.
-    // Cursor 100, realtime missed 101-497, diff brings 498-500.
-    seedChannel(MARKED_ID, 100);
-    const sync = vi.spyOn(service, '_syncNewerMessages').mockResolvedValue({});
-    vi.spyOn(service, '_insertTooLongMessages').mockImplementation(() => {
-      service._updateChannelCursors(MARKED_ID, { lastMessageId: 500, lastMessageDate: null });
-    });
-
-    await service._handleChannelTooLong({
-      channelId: BARE_ID,
-      diff: { messages: [{ _: 'message', id: 500 }] },
-    });
-
-    expect(sync).toHaveBeenCalledWith(MARKED_ID, { fromMessageId: 100 });
-    vi.restoreAllMocks();
-  });
-
   it('_syncNewerMessages honours a caller floor below the cursor', async () => {
     seedChannel(MARKED_ID, 500);
     telegramClient.getMessagesByChannelId.mockResolvedValue({
@@ -291,7 +271,7 @@ describe('review fixes', () => {
 
     await service._syncNewerMessages(MARKED_ID, { fromMessageId: 100 });
 
-    expect(telegramClient.getMessagesByChannelId.mock.calls[0][2]).toEqual({ minId: 100 });
+    expect(telegramClient.getMessagesByChannelId.mock.calls[0][2]).toEqual({ afterId: 100 });
   });
 
   it('never pages further forward than the cursor when the floor is above it', async () => {
@@ -302,24 +282,7 @@ describe('review fixes', () => {
 
     await service._syncNewerMessages(MARKED_ID, { fromMessageId: 900 });
 
-    expect(telegramClient.getMessagesByChannelId.mock.calls[0][2]).toEqual({ minId: 100 });
-  });
-
-  it('falls back to the id conversion when a diff message has no resolvable peer', async () => {
-    // mtcute throws building Message.chat for a raw message with no peerId.
-    // That must not escape and cost us the catch-up entirely.
-    seedChannel(MARKED_ID, 100);
-    telegramClient.getMessagesByChannelId.mockResolvedValue({
-      peerTitle: 'Test Chat', peerType: 'channel', messages: [],
-    });
-
-    await service._handleChannelTooLong({
-      channelId: BARE_ID,
-      diff: { messages: [{ _: 'message', id: 500 }] },
-    });
-
-    expect(telegramClient.getMessagesByChannelId).toHaveBeenCalled();
-    expect(telegramClient.getMessagesByChannelId.mock.calls[0][0]).toBe(MARKED_ID);
+    expect(telegramClient.getMessagesByChannelId.mock.calls[0][2]).toEqual({ afterId: 100 });
   });
 
   it('leaves an existing queued job alone instead of rewriting its depth', async () => {
@@ -338,17 +301,6 @@ describe('review fixes', () => {
     vi.restoreAllMocks();
   });
 
-  it('never queues a retry with the 1000-message default for an empty channel', async () => {
-    seedChannel(MARKED_ID, 100);          // channel row, but no archived messages
-    telegramClient.getMessagesByChannelId.mockRejectedValue(new Error('FLOOD_WAIT_420'));
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
-
-    await service._handleChannelTooLong({ channelId: BARE_ID, diff: { messages: [] } });
-
-    expect(service.listJobs({ channelId: MARKED_ID })[0].target_message_count).toBe(1);
-    vi.restoreAllMocks();
-  });
-
   it('reconciles from the subscriber floor so an interior hole is healed', async () => {
     // Realtime missed 159-160 but then archived 161, so the channel cursor
     // already sits above the hole. Only the subscriber's own cursor finds it.
@@ -359,7 +311,7 @@ describe('review fixes', () => {
 
     await service.reconcileChannelsAgainstLive([{ channelId: MARKED_ID, sinceMessageId: 158 }]);
 
-    expect(telegramClient.getMessagesByChannelId.mock.calls[0][2]).toEqual({ minId: 158 });
+    expect(telegramClient.getMessagesByChannelId.mock.calls[0][2]).toEqual({ afterId: 158 });
   });
 
   it('coalesces concurrent reconciles of the same channel into one live call', async () => {

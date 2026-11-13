@@ -38,6 +38,7 @@ vi.mock('../core/control-client.js', () => ({
   ensureServer: (...args) => control.ensureServer(...args),
   invoke: (...args) => control.invoke(...args),
   pingServer: vi.fn(),
+  syncServerVersion: vi.fn(async () => 'current'),
   enqueueBackfill: (...args) => control.enqueueBackfill(...args),
   cancelBackfill: vi.fn(),
   retryBackfill: vi.fn(),
@@ -70,6 +71,7 @@ function makeFakeServices(overrides = {}) {
       processing: false,
     })),
     listJobs: vi.fn(() => []),
+    listRepairs: vi.fn(() => []),
     addJob: vi.fn((chat) => ({ id: 1, channel_id: chat, status: 'pending' })),
     setChannelSync: vi.fn((chat, enabled) => ({
       channel_id: chat,
@@ -136,7 +138,7 @@ describe('backfill is a canonical alias of sync', () => {
   it('`backfill jobs add` resolves the nested subcommand and queues a job on the server (like `sync jobs add`)', async () => {
     services.current = makeFakeServices();
     await runProgram(['backfill', 'jobs', 'add', '--chat', '@chan']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s' });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     expect(control.enqueueBackfill).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
       chatId: '@chan',
       depth: null,
@@ -187,6 +189,7 @@ describe('channels watch / unwatch', () => {
       op: 'channelSetSync',
       args: { chat: '@chan', enable: true },
       timeoutMs: undefined,
+      quiet: false,
     });
   });
 
@@ -196,6 +199,18 @@ describe('channels watch / unwatch', () => {
       op: 'channelSetSync',
       args: { chat: '@chan', enable: false },
       timeoutMs: undefined,
+      quiet: false,
+    });
+  });
+
+  it('`channels unwatch --missing` routes channelsUnwatchMissing to the server', async () => {
+    control.invoke.mockResolvedValueOnce({ channelIds: ['-1000000000820'] });
+    await runProgram(['channels', 'unwatch', '--missing']);
+    expect(control.invoke).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
+      op: 'channelsUnwatchMissing',
+      args: {},
+      timeoutMs: undefined,
+      quiet: false,
     });
   });
 
@@ -216,6 +231,7 @@ describe('channels watch / unwatch', () => {
       op: 'channelSetSync',
       args: { chat: '@chan', enable: true },
       timeoutMs: undefined,
+      quiet: false,
     });
 
     control.invoke.mockClear();
@@ -224,6 +240,7 @@ describe('channels watch / unwatch', () => {
       op: 'channelSetSync',
       args: { chat: '@chan', enable: false },
       timeoutMs: undefined,
+      quiet: false,
     });
   });
 });
