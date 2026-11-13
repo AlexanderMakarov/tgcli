@@ -7,6 +7,9 @@ let hub;
 
 afterEach(async () => {
   if (server) {
+    // Tests leave SSE streams open; close() alone waits for them to end (~8s,
+    // past the 10s hook timeout on slower CI runners).
+    server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
     server = null;
   }
