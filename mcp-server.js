@@ -2,6 +2,7 @@ import http from "http";
 import fs from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
+import { fileURLToPath } from "url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -9,6 +10,7 @@ import { z } from "zod";
 
 import { loadConfig, validateConfig } from "./core/config.js";
 import { createServices } from "./core/services.js";
+import { createTelegramConnector } from "./core/telegram-connection.js";
 import { resolveStoreDir } from "./core/store.js";
 import {
   createControlRequestHandler,
@@ -17,14 +19,28 @@ import {
   removeControlFile,
   isIdle,
 } from "./core/control-server.js";
+import { ServerStats } from "./core/server-stats.js";
+import { readVersion } from "./core/version.js";
+import { captureServerOutput } from "./core/server-log.js";
 import { readJsonBody } from "./core/http-util.js";
 import { parseDuration } from "./core/duration.js";
-import { OPERATIONS } from "./core/operations.js";
 import { handleSubscribeRequest } from "./core/subscriptions.js";
+import { OPERATIONS, archiveKey } from "./core/operations.js";
+import { isChatId } from "./core/chat-key.js";
 
 const SERVICE_STATE_FILE = "service-state.json";
 
 const storeDir = resolveStoreDir();
+// `tgcli server` pipes this process's output into <store>/server.log itself, so
+// that even a failure to load this module is logged. Run directly (`npm start`),
+// the server writes the log on its own, from here on.
+if (process.env.TGCLI_SERVER_LOG === "wrapper") {
+  // If the wrapper dies, its pipes close; losing output must not kill the server.
+  process.stdout.on("error", () => {});
+  process.stderr.on("error", () => {});
+} else {
+  captureServerOutput(storeDir);
+}
 const { config, path: configPath } = loadConfig(storeDir);
 const missingConfig = validateConfig(config ?? {});
 if (missingConfig.length > 0) {
@@ -50,15 +66,24 @@ const CONTROL_PORT = Number.isFinite(controlPortRaw) && controlPortRaw > 0 ? con
 // via argv or the TGCLI_IDLE_EXIT env var. When unset/zero the server stays up
 // forever. See resolveIdleExitMs for the ms-vs-duration-string handling.
 const IDLE_EXIT_MS = resolveIdleExitMs(readIdleExitArg());
+// Set by ensureServer on the servers it starts, which a newer CLI may then replace.
+// Any other server belongs to the user.
+const AUTO_STARTED = process.argv.includes("--auto-started");
 const IDLE_CHECK_INTERVAL_MS = 5000;
+// How long a shutdown lets control requests already being answered finish.
+const CONTROL_DRAIN_MS = 10000;
+console.log(`[startup] tgcli server ${readVersion()} (pid ${process.pid}, ${AUTO_STARTED ? "auto-started" : "started by hand"}${IDLE_EXIT_MS > 0 ? `, idle exit after ${IDLE_EXIT_MS}ms` : ""})`);
 
-const { telegramClient, messageSyncService } = createServices({ storeDir, config });
+const stats = new ServerStats();
+const { telegramClient, messageSyncService } = createServices({ storeDir, config, stats });
 
-let telegramReady = false;
-let telegramConnectPromise = null;
+const ensureTelegramConnected = createTelegramConnector({ telegramClient, messageSyncService });
+
 let serviceState = null;
 let controlToken = null;
 let controlServer = null;
+let controlHandler = null;
+let controlFileWritten = false;
 let idleTimer = null;
 let lastControlActivityAt = Date.now();
 
@@ -98,16 +123,6 @@ function resolveIdleExitMs(value) {
   }
 }
 
-function readVersion() {
-  try {
-    const pkgPath = new URL("./package.json", import.meta.url);
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
-    return pkg.version || "0.0.0";
-  } catch (error) {
-    return "0.0.0";
-  }
-}
-
 function writeServiceState(nextState) {
   if (!nextState) {
     return;
@@ -134,49 +149,6 @@ function updateServiceState(patch) {
     updatedAt: new Date().toISOString(),
   };
   writeServiceState(serviceState);
-}
-
-// Connect the warm Telegram client (login + realtime updates). This is the
-// readiness gate for operations: it does NOT seed the dialog archive, so it
-// completes in a few seconds even on a large account. A single in-flight promise
-// is shared so concurrent callers (the ensureLogin hook each control handler
-// runs) await one connect rather than starting several.
-function ensureTelegramConnected() {
-  if (telegramReady) {
-    return Promise.resolve();
-  }
-  if (!telegramConnectPromise) {
-    telegramConnectPromise = (async () => {
-      console.log("[startup] Connecting Telegram client...");
-      const dialogsReady = await telegramClient.initializeDialogCache();
-      if (!dialogsReady) {
-        throw new Error("Failed to initialize Telegram dialog list");
-      }
-      telegramReady = true;
-      console.log("[startup] Telegram client connected.");
-      // Seed the archive registry and start realtime/queue work in the
-      // background; ops do their own live fetches and must not wait on the full
-      // dialog refresh, which is slow on large accounts.
-      void seedArchiveInBackground();
-    })().catch((error) => {
-      // Reset so a later operation can retry the connect instead of being stuck
-      // on a permanently rejected promise.
-      telegramConnectPromise = null;
-      throw error;
-    });
-  }
-  return telegramConnectPromise;
-}
-
-async function seedArchiveInBackground() {
-  try {
-    const dialogCount = await messageSyncService.refreshChannelsFromDialogs();
-    console.log(`[startup] Seeded ${dialogCount} dialogs into archive registry.`);
-    messageSyncService.startRealtimeSync();
-    messageSyncService.resumePendingJobs();
-  } catch (error) {
-    console.error(`[startup] Background archive seeding failed: ${error?.message ?? error}`);
-  }
 }
 
 /**
@@ -647,6 +619,13 @@ function createServerInstance() {
   // The shared operation handlers run against the same warm services the control
   // API uses, so an MCP tool and the matching CLI command execute identical logic.
   const warmServices = { telegramClient, messageSyncService };
+  // A username needs Telegram to find the id the archive keeps the chat under.
+  const archiveKeyFor = async (chat) => {
+    if (!isChatId(chat)) {
+      await ensureTelegramConnected();
+    }
+    return archiveKey(warmServices, chat);
+  };
 
   server.tool(
     "listChannels",
@@ -709,6 +688,9 @@ function createServerInstance() {
     "Assign tags to a channel for later cross-channel search.",
     setChannelTagsSchema,
     async ({ channelId, tags, source }) => {
+      if (!isChatId(channelId)) {
+        await ensureTelegramConnected();
+      }
       const result = await OPERATIONS.tagsSet(warmServices, { chat: channelId, tags, source });
 
       return {
@@ -727,6 +709,9 @@ function createServerInstance() {
     "List tags attached to a channel.",
     listChannelTagsSchema,
     async ({ channelId, source }) => {
+      if (!isChatId(channelId)) {
+        await ensureTelegramConnected();
+      }
       const tags = await OPERATIONS.tagsList(warmServices, { chat: channelId, source });
 
       return {
@@ -787,7 +772,7 @@ function createServerInstance() {
     "Returns cached metadata for a channel.",
     getChannelMetadataSchema,
     async ({ channelId }) => {
-      const metadata = messageSyncService.getChannelMetadata(channelId);
+      const metadata = messageSyncService.getChannelMetadata(await archiveKeyFor(channelId));
 
       return {
         content: [
@@ -1443,7 +1428,8 @@ function createServerInstance() {
     scheduleMessageSyncSchema,
     async ({ channelId, depth, minDate }) => {
       await ensureTelegramConnected();
-      const job = messageSyncService.addJob(channelId, { depth, minDate });
+      const chatId = await messageSyncService.resolveChatKey(channelId);
+      const job = messageSyncService.addJob(chatId, { depth, minDate });
       void messageSyncService.processQueue();
 
       return {
@@ -1469,7 +1455,7 @@ function createServerInstance() {
         .describe("Numeric channel ID or username"),
     },
     async ({ channelId }) => {
-      const stats = messageSyncService.getMessageStats(channelId);
+      const stats = messageSyncService.getMessageStats(await archiveKeyFor(channelId));
 
       return {
         content: [
@@ -1808,7 +1794,14 @@ if (controlEnabled) {
     // Await the shared connect before any op touches MTProto; the connect is
     // kicked off in the background once the listeners are up.
     ensureLogin: () => ensureTelegramConnected(),
+    // `tgcli server stop` / `restart`.
+    onShutdown: () => {
+      void shutdown("stop requested over the control API").finally(() => process.exit(0));
+    },
+    root: path.dirname(fileURLToPath(import.meta.url)),
+    stats,
   });
+  controlHandler = handleControlRequest;
 
   controlServer = http.createServer((req, res) => {
     if (req.method === "OPTIONS") {
@@ -1820,6 +1813,12 @@ if (controlEnabled) {
 
   controlServer.on("error", (error) => {
     console.error(`[control] server error: ${error.message}`);
+    // Two CLIs raced to auto-start a server and the other one won. Staying up here
+    // would leave a second writer that no CLI can reach or replace. A server started
+    // by hand keeps running, since its other work does not need the control port.
+    if (error.code === "EADDRINUSE" && AUTO_STARTED) {
+      process.exit(1);
+    }
   });
 
   controlServer.listen(CONTROL_PORT, CONTROL_HOST, () => {
@@ -1832,7 +1831,10 @@ if (controlEnabled) {
         token: controlToken,
         startedAt,
         version: serviceState.version,
+        autoStarted: AUTO_STARTED,
+        manager: serviceState.manager,
       });
+      controlFileWritten = true;
     } catch (error) {
       console.error(`[control] failed to write control.json: ${error?.message ?? error}`);
     }
@@ -1868,8 +1870,7 @@ if (IDLE_EXIT_MS > 0) {
       idleExitMs: IDLE_EXIT_MS,
     });
     if (idle) {
-      console.log("[shutdown] idle window elapsed with no work; exiting.");
-      void shutdown().finally(() => process.exit(0));
+      void shutdown("idle window elapsed with no work").finally(() => process.exit(0));
     }
   }, IDLE_CHECK_INTERVAL_MS);
   if (typeof idleTimer.unref === "function") {
@@ -1877,12 +1878,17 @@ if (IDLE_EXIT_MS > 0) {
   }
 }
 
-async function shutdown() {
-  if (shuttingDown) {
-    return;
-  }
+// Every caller gets the one shutdown in flight, so a second request (a signal
+// after a control API stop, say) waits for it instead of exiting halfway.
+let shutdownPromise = null;
+function shutdown(reason) {
+  shutdownPromise ??= runShutdown(reason);
+  return shutdownPromise;
+}
+
+async function runShutdown(reason) {
   shuttingDown = true;
-  console.log("[shutdown] received termination signal, closing resources...");
+  console.log(`[shutdown] ${reason}; closing resources...`);
   const closeTasks = [];
   for (const record of sessions.values()) {
     const task = closeSessionRecord(record, "shutdown");
@@ -1906,19 +1912,21 @@ async function shutdown() {
   }
 
   if (controlServer) {
-    controlServer.closeAllConnections?.();
-    controlServer.close(() => {
+    // Take no new connections, let the requests other CLIs are waiting on finish,
+    // then drop what is left.
+    const closingServer = controlServer;
+    controlServer = null;
+    closingServer.close(() => {
       console.log("[shutdown] control server closed");
     });
-    controlServer = null;
-  }
-
-  if (controlEnabled) {
-    try {
-      removeControlFile(storeDir);
-    } catch (error) {
-      console.error(`[shutdown] failed to remove control.json: ${error?.message ?? error}`);
+    const drainDeadline = Date.now() + CONTROL_DRAIN_MS;
+    while ((controlHandler?.inFlight() ?? 0) > 0 && Date.now() < drainDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
+    if ((controlHandler?.inFlight() ?? 0) > 0) {
+      console.log(`[shutdown] dropping ${controlHandler.inFlight()} control request(s) still running`);
+    }
+    closingServer.closeAllConnections?.();
   }
 
   try {
@@ -1933,14 +1941,24 @@ async function shutdown() {
     console.error(`[shutdown] error while closing Telegram client: ${error?.message ?? error}`);
   }
 
+  // Last, so a CLI that arrives mid-shutdown can see this process and wait for it.
+  if (controlFileWritten) {
+    try {
+      removeControlFile(storeDir, { pid: process.pid, token: controlToken });
+    } catch (error) {
+      console.error(`[shutdown] failed to remove control.json: ${error?.message ?? error}`);
+    }
+  }
+
   updateServiceState({
     stoppedAt: new Date().toISOString(),
     pid: null,
   });
+  console.log("[shutdown] done");
 }
 
-const handleShutdownSignal = () => {
-  void shutdown().finally(() => process.exit(0));
+const handleShutdownSignal = (signal) => {
+  void shutdown(`received ${signal}`).finally(() => process.exit(0));
 };
 
 process.prependListener("SIGINT", handleShutdownSignal);

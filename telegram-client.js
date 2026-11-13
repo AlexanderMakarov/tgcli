@@ -1,6 +1,6 @@
 import { TelegramClient as MtCuteClient } from '@mtcute/node';
-import { InputMedia } from '@mtcute/core';
-import { randomLong } from '@mtcute/core/utils.js';
+import { InputMedia, Message, MtPeerNotFoundError, PeersIndex, networkMiddlewares } from '@mtcute/core';
+import { randomLong, toggleChannelIdMark } from '@mtcute/core/utils.js';
 import { html } from '@mtcute/html-parser';
 import { md } from '@mtcute/markdown-parser';
 import QRCode from 'qrcode';
@@ -14,6 +14,9 @@ import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { nodeReadableToFuman } from '@fuman/node';
 import { resolveStoreDir, resolveStorePaths } from './core/store.js';
+
+// How long a session Telegram confirmed is taken as logged in without asking again.
+const AUTH_CHECK_TTL_MS = 5 * 60 * 1000;
 
 const timeoutPatchKey = Symbol.for('tgcli.timeoutPatch');
 if (!globalThis[timeoutPatchKey]) {
@@ -175,7 +178,7 @@ function buildTextSendParams(options = {}) {
   if (options.silent) params.silent = true;
   if (options.noForwards || options.noforwards) params.forbidForwards = true;
   const scheduleDate = resolveScheduleDate(options);
-  if (scheduleDate) params.scheduleDate = scheduleDate;
+  if (scheduleDate) params.schedule = new Date(scheduleDate * 1000);
   return Object.keys(params).length ? params : undefined;
 }
 
@@ -186,7 +189,7 @@ function buildMediaSendParams(options = {}) {
   if (options.silent) params.silent = true;
   if (options.noForwards || options.noforwards) params.forbidForwards = true;
   const scheduleDate = resolveScheduleDate(options);
-  if (scheduleDate) params.scheduleDate = scheduleDate;
+  if (scheduleDate) params.schedule = new Date(scheduleDate * 1000);
   if (options.captionAbove) params.invert = true;
   return Object.keys(params).length ? params : undefined;
 }
@@ -202,6 +205,33 @@ function resolveUploadPath(filePath) {
   return `file:${resolved}`;
 }
 
+// mtcute writes a min peer over the complete one it already has, access hash included
+// (still so in 0.32.7). A min row counts as having no hash, so from then on the chat
+// cannot be looked up, and an update that hits a pts gap is lost: getChannelDifference
+// finds no peer, or is refused with CHANNEL_INVALID. A min copy adds nothing worth that.
+function keepCompletePeersOverMinCopies(client) {
+  const { peers, refMsgs } = client.storage;
+  const store = peers.store.bind(peers);
+  peers.store = async (peer) => {
+    const isChannel = peer._ === 'channel' || peer._ === 'channelForbidden';
+    const id = isChannel ? toggleChannelIdMark(peer.id) : peer.id;
+    if (peer.min) {
+      const existing = await peers.getCompleteById(id);
+      if (existing && !existing.min) {
+        await refMsgs.deleteByPeer(id);
+        return;
+      }
+    }
+    await store(peer);
+    // store() caches a channel under its bare id while lookups go by the marked one, so
+    // a lookup that cached the min row would go on answering with its hash. Overwritten,
+    // not deleted, since LruMap.delete unlinks everything older than the entry.
+    if (isChannel && !peer.min && peers._cache.get(id)) {
+      peers._cache.set(id, peers._cache.get(peer.id));
+    }
+  };
+}
+
 function resolveOptionalCaption(caption) {
   if (typeof caption !== 'string') return undefined;
   const trimmed = caption.trim();
@@ -210,6 +240,7 @@ function resolveOptionalCaption(caption) {
 
 function buildSendMessageResult(sent, { method, defaultMediaType } = {}) {
   const result = { messageId: sent?.id ?? null };
+  if (sent?.isScheduled) result.scheduled = true;
   if (method) result.method = method;
   const media = summarizeMedia(sent?.media) ?? (defaultMediaType ? { type: defaultMediaType } : null);
   if (media) result.media = media;
@@ -239,20 +270,31 @@ function randomIdsEqual(left, right) {
   return String(left) === String(right);
 }
 
-function extractMessageIdFromSendUpdates(response, randomId) {
+const SENT_MESSAGE_UPDATES = new Set(['updateNewMessage', 'updateNewChannelMessage', 'updateNewScheduledMessage']);
+
+// What a send response says about the message it sent: its id and, when the
+// response carries the message itself, the update holding it.
+function readSendResponse(response, randomId) {
   const updates = Array.isArray(response?.updates) ? response.updates : [];
-  for (const update of updates) {
-    if (update?._ === 'updateMessageID' && randomIdsEqual(update.randomId, randomId)) {
-      return update.id;
-    }
+  const assignedId = updates.find(
+    (update) => update?._ === 'updateMessageID' && randomIdsEqual(update.randomId, randomId),
+  )?.id;
+  const messageUpdates = updates.filter((update) => SENT_MESSAGE_UPDATES.has(update?._));
+  const messageUpdate = assignedId === undefined
+    ? messageUpdates[0]
+    : messageUpdates.find((update) => update.message?.id === assignedId);
+  return { messageId: assignedId ?? messageUpdate?.message?.id ?? null, messageUpdate };
+}
+
+// The send has already gone through at this point, so a response that cannot be
+// parsed must not fail it.
+function parseSentMessage(messageUpdate, response, peerRef) {
+  try {
+    return new Message(messageUpdate.message, PeersIndex.from(response), messageUpdate._ === 'updateNewScheduledMessage');
+  } catch (error) {
+    console.error(`[sendPhoto] Failed to parse sent message ${messageUpdate.message?.id} for peer ${peerRef}: ${error.message}`);
+    return null;
   }
-  for (const update of updates) {
-    if (update?._ === 'updateNewMessage' || update?._ === 'updateNewChannelMessage'
-        || update?._ === 'updateNewScheduledMessage') {
-      return update.message?.id ?? null;
-    }
-  }
-  return null;
 }
 
 function coerceApiId(value) {
@@ -469,6 +511,43 @@ function resolveDownloadLocation(media) {
   return null;
 }
 
+// Errors about a chat itself: the account has left it or was removed, it is gone, or
+// Telegram does not know it. Anything else, such as a broken session, says nothing
+// about the chat.
+const CHAT_GONE_ERRORS = new Set([
+  'CHANNEL_INVALID',
+  'CHANNEL_PRIVATE',
+  'CHAT_FORBIDDEN',
+  'CHAT_ID_INVALID',
+  'PEER_ID_INVALID',
+  'USER_BANNED_IN_CHANNEL',
+]);
+
+export function isChatGone(error) {
+  return error instanceof MtPeerNotFoundError || CHAT_GONE_ERRORS.has(error?.text);
+}
+
+// What Telegram says about the account in a channel or group: 'member', 'left' (left, or
+// never joined), 'gone' (removed, banned, the chat deleted or migrated) or 'unknown'.
+// Only a chat Telegram returns decides: an error may mean a bad access hash, not a left chat.
+function membershipOf(chat) {
+  switch (chat?._) {
+    case 'channel':
+      return chat.left ? 'left' : 'member';
+    case 'chat':
+      if (chat.deactivated || chat.migratedTo) {
+        return 'gone';
+      }
+      return chat.left ? 'left' : 'member';
+    case 'channelForbidden':
+    case 'chatForbidden':
+    case 'chatEmpty':
+      return 'gone';
+    default:
+      return null;
+  }
+}
+
 export function normalizeChannelId(channelId) {
   if (typeof channelId === 'number') {
     return channelId;
@@ -551,14 +630,21 @@ class TelegramClient {
       apiId: this.apiId,
       apiHash: this.apiHash,
       storage: this.sessionPath,
+      // A delayed write of a min copy can land after the complete row that replaced it.
+      storageOptions: { peers: { updatesWriteInterval: 0 } },
       platform: createPlatform(),
     };
+    if (this.options.stats) {
+      clientOptions.network = { middlewares: this.options.stats.networkMiddlewares(networkMiddlewares.basic()) };
+    }
     if (this.options.disableUpdates) {
       clientOptions.disableUpdates = true;
     } else {
       clientOptions.updates = this.updatesConfig;
     }
-    return new MtCuteClient(clientOptions);
+    const client = new MtCuteClient(clientOptions);
+    keepCompletePeersOverMinCopies(client);
+    return client;
   }
 
   _isAuthKeyUnregisteredError(error) {
@@ -581,8 +667,10 @@ class TelegramClient {
       console.warn('[warning] failed to destroy MTProto client during reset:', error?.message || error);
     }
     this.client = this._createClient();
+    this.authorizedUntil = 0;
     this.updatesRunning = false;
     this.rawUpdateHandler = null;
+    this.updateEmitter.emit('clientReplaced');
   }
 
   async _resetSessionAndClient() {
@@ -609,11 +697,20 @@ class TelegramClient {
     return message.includes('AUTH_KEY') || message.includes('AUTHORIZATION') || message.includes('SESSION_PASSWORD_NEEDED');
   }
 
-  async _isAuthorized() {
+  // getMe is a request to Telegram, and ensureLogin runs before every page of history and
+  // every recheck, so a yes stands for AUTH_CHECK_TTL_MS: asking each time doubled the
+  // requests of a backfill or a repair. A revoked session still fails the request itself.
+  // fresh asks Telegram regardless, for login and for commands that report the state.
+  async _isAuthorized({ fresh = false } = {}) {
+    if (!fresh && Date.now() < (this.authorizedUntil ?? 0)) {
+      return true;
+    }
     try {
       await this.client.getMe();
+      this.authorizedUntil = Date.now() + AUTH_CHECK_TTL_MS;
       return true;
     } catch (error) {
+      this.authorizedUntil = 0;
       if (this._isUnauthorizedError(error)) {
         return false;
       }
@@ -622,7 +719,7 @@ class TelegramClient {
   }
 
   async isAuthorized() {
-    return this._isAuthorized();
+    return this._isAuthorized({ fresh: true });
   }
 
   async getCurrentUser() {
@@ -757,7 +854,7 @@ class TelegramClient {
 
   async login(retriedAfterReset = false, retriedAfterSessionReset = false) {
     try {
-      const hasExistingSession = await this._isAuthorized();
+      const hasExistingSession = await this._isAuthorized({ fresh: true });
 
       if (!hasExistingSession && !this.options.useQr && !this.phoneNumber) {
         throw new Error('TELEGRAM_PHONE_NUMBER is not configured.');
@@ -811,13 +908,69 @@ class TelegramClient {
     return true;
   }
 
-  async listDialogs(limit = 50, retriedAfterSessionReset = false) {
+  // Asks Telegram about the account's membership in channels and groups, given marked
+  // ids, with one request per 100 of each kind. Returns a Map of id to 'member', 'left',
+  // 'gone' or 'unknown'; private chats have no membership and are left out.
+  async getChatMembership(chatIds) {
+    await this.ensureLogin();
+    const result = new Map();
+    const channels = [];
+    const groups = [];
+    for (const id of chatIds) {
+      let peer;
+      try {
+        peer = await this.client.resolvePeer(Number(id));
+      } catch {
+        // Not in the peer cache, or not an id mtcute can parse: nothing to ask with.
+        result.set(String(id), 'unknown');
+        continue;
+      }
+      if (peer._ === 'inputPeerChannel') {
+        channels.push({ id: String(id), input: { _: 'inputChannel', channelId: peer.channelId, accessHash: peer.accessHash } });
+      } else if (peer._ === 'inputPeerChat') {
+        groups.push({ id: String(id), input: peer.chatId });
+      }
+    }
+
+    const ask = async (items, request, markedId) => {
+      for (let start = 0; start < items.length; start += 100) {
+        const batch = items.slice(start, start + 100);
+        let chats;
+        try {
+          ({ chats } = await this.client.call(request(batch.map((item) => item.input))));
+        } catch (error) {
+          if (!isChatGone(error)) {
+            throw error;
+          }
+          if (batch.length === 1) {
+            // A stale or min access hash is refused the same way: no answer about the chat.
+            result.set(batch[0].id, 'unknown');
+            continue;
+          }
+          // One refused chat fails the whole batch, so ask about each on its own.
+          for (const item of batch) {
+            await ask([item], request, markedId);
+          }
+          continue;
+        }
+        const byId = new Map(chats.map((chat) => [markedId(chat.id), membershipOf(chat)]));
+        for (const item of batch) {
+          result.set(item.id, byId.get(item.id) ?? 'unknown');
+        }
+      }
+    };
+    await ask(channels, (id) => ({ _: 'channels.getChannels', id }), (rawId) => String(toggleChannelIdMark(rawId)));
+    await ask(groups, (id) => ({ _: 'messages.getChats', id }), (rawId) => String(-rawId));
+    return result;
+  }
+
+  async listDialogs(limit = 50, { includeArchived = false, retriedAfterSessionReset = false } = {}) {
     try {
       await this.ensureLogin();
       const effectiveLimit = limit && limit > 0 ? limit : Infinity;
       const results = [];
 
-      for await (const dialog of this.client.iterDialogs({})) {
+      for await (const dialog of this.client.iterDialogs({ archived: includeArchived ? 'keep' : 'exclude' })) {
         const peer = dialog.peer;
         if (!peer) continue;
 
@@ -836,6 +989,7 @@ class TelegramClient {
           isGroup,
           unreadCount: typeof dialog.unreadCount === 'number' ? dialog.unreadCount : 0,
           unreadMentionsCount: typeof dialog.unreadMentionsCount === 'number' ? dialog.unreadMentionsCount : 0,
+          topMessageId: dialog.raw.topMessage,
         });
 
         if (results.length >= effectiveLimit) {
@@ -852,7 +1006,7 @@ class TelegramClient {
         if (!loginSuccess) {
           throw new Error('Failed to restore session after dialog fetch reset.');
         }
-        return this.listDialogs(limit, true);
+        return this.listDialogs(limit, { includeArchived, retriedAfterSessionReset: true });
       }
       throw error;
     }
@@ -940,7 +1094,6 @@ class TelegramClient {
     await this.ensureLogin();
 
     const {
-      minId = 0,
       maxId = 0,
       reverse = false,
       offsetId = 0,
@@ -954,7 +1107,6 @@ class TelegramClient {
     const effectiveBeforeId = normalizePositiveMessageId(beforeId)
       || normalizePositiveMessageId(offsetId);
     const effectiveAfterId = normalizePositiveMessageId(afterId);
-    const effectiveMinId = effectiveAfterId || normalizePositiveMessageId(minId);
     const effectiveMaxId = normalizePositiveMessageId(maxId);
     const useAfterIdPagination = Boolean(effectiveAfterId);
     const messages = [];
@@ -965,27 +1117,33 @@ class TelegramClient {
       reverse: useAfterIdPagination ? true : reverse,
     };
 
-    if (effectiveMinId) {
-      iterOptions.minId = effectiveMinId;
-    }
-
     if (effectiveMaxId) {
       iterOptions.maxId = effectiveMaxId;
     }
 
+    if (useAfterIdPagination) {
+      // Telegram slices the history by offset before it applies min_id, so the slice
+      // has to start right above afterId. mtcute's default reverse offset starts at the
+      // chat's oldest messages, and min_id would then filter that whole slice away.
+      iterOptions.offset = { id: effectiveAfterId + 1, date: 0 };
+    }
+
     if (effectiveBeforeId) {
       if (useAfterIdPagination || iterOptions.maxId) {
-        const boundedMaxId = Math.max(0, effectiveBeforeId - 1);
+        // max_id excludes its own id, as beforeId does.
         iterOptions.maxId = iterOptions.maxId
-          ? Math.min(iterOptions.maxId, boundedMaxId)
-          : boundedMaxId;
+          ? Math.min(iterOptions.maxId, effectiveBeforeId)
+          : effectiveBeforeId;
       } else {
         iterOptions.offset = { id: effectiveBeforeId, date: 0 };
         iterOptions.addOffset = 0;
       }
     }
 
+    // resolvePeer gives an input peer, which has no title or type of its own.
+    let chat = null;
     for await (const message of this.client.iterHistory(peer, iterOptions)) {
+      chat ??= message.chat;
       messages.push(this._serializeMessage(message, peer));
       if (messages.length >= effectiveLimit) {
         break;
@@ -997,9 +1155,9 @@ class TelegramClient {
     }
 
     return {
-      peerTitle: peer?.displayName || 'Unknown',
+      peerTitle: chat?.displayName ?? null,
       peerId: peer?.id?.toString?.() ?? String(channelId),
-      peerType: normalizePeerType(peer),
+      peerType: chat ? normalizePeerType(chat) : null,
       messages: filterSerializedMessagesById(messages, {
         beforeId: effectiveBeforeId,
         afterId: effectiveAfterId,
@@ -1113,7 +1271,8 @@ class TelegramClient {
     const params = buildTextSendParams(options);
     const peerRef = normalizeChannelId(channelId);
     const sent = await this.client.sendText(peerRef, inputText, params);
-    return { messageId: sent.id };
+    options.onSent?.(sent);
+    return sent.isScheduled ? { messageId: sent.id, scheduled: true } : { messageId: sent.id };
   }
 
   async sendFileMessage(channelId, filePath, options = {}) {
@@ -1136,6 +1295,7 @@ class TelegramClient {
     const media = InputMedia.auto(uploadPath, mediaOptions);
     const peerRef = normalizeChannelId(channelId);
     const sent = await this.client.sendMedia(peerRef, media, buildMediaSendParams(options));
+    options.onSent?.(sent);
     return buildSendMessageResult(sent, { method: 'sendDocument', defaultMediaType: 'document' });
   }
 
@@ -1177,7 +1337,7 @@ class TelegramClient {
     };
   }
 
-  async sendPreparedPhotoMessage(prepared) {
+  async sendPreparedPhotoMessage(prepared, { onSent } = {}) {
     const peer = await this.client.resolvePeer(prepared.peerRef);
     const chatId = peer?._ === 'inputPeerSelf'
       ? String(prepared.peerRef)
@@ -1186,22 +1346,29 @@ class TelegramClient {
     const request = { ...prepared.request, peer, media: normalizedMedia };
     const result = await this.client.call(request);
     this.client.handleClientUpdate(result, true);
-    const messageId = extractMessageIdFromSendUpdates(result, prepared.request.randomId);
+    const { messageId, messageUpdate } = readSendResponse(result, prepared.request.randomId);
+    const sentMessage = onSent && messageUpdate ? parseSentMessage(messageUpdate, result, prepared.peerRef) : null;
+    if (sentMessage) onSent(sentMessage);
     if (!messageId) {
       throw new Error('Failed to resolve sent photo message id from Telegram updates.');
     }
+    const scheduledField = prepared.request.scheduleDate ? { scheduled: true } : {};
     let sent;
     try {
-      [sent] = await this.client.getMessages(prepared.peerRef, Number(messageId));
+      // Scheduled messages have their own id space; getMessages would miss them or hit an unrelated message.
+      [sent] = prepared.request.scheduleDate
+        ? await this.client.getScheduledMessages(prepared.peerRef, Number(messageId))
+        : await this.client.getMessages(prepared.peerRef, Number(messageId));
     } catch (error) {
-      console.error(`[sendPhoto] getMessages enrichment failed for peer ${prepared.peerRef}, message ${messageId}: ${error.message}`);
+      console.error(`[sendPhoto] message lookup for enrichment failed for peer ${prepared.peerRef}, message ${messageId}: ${error.message}`);
     }
     if (sent) {
-      return { chatId, ...buildSendMessageResult(sent, { method: 'sendPhoto', defaultMediaType: 'photo' }) };
+      return { chatId, ...buildSendMessageResult(sent, { method: 'sendPhoto', defaultMediaType: 'photo' }), ...scheduledField };
     }
     return {
       chatId,
       messageId: Number(messageId),
+      ...scheduledField,
       method: 'sendPhoto',
       media: { type: 'photo' },
       warning: 'Media enrichment failed; file_id unavailable',
@@ -1210,7 +1377,7 @@ class TelegramClient {
 
   async sendPhotoMessage(channelId, filePath, options = {}) {
     const prepared = await this.preparePhotoMessage(channelId, filePath, options);
-    return this.sendPreparedPhotoMessage(prepared);
+    return this.sendPreparedPhotoMessage(prepared, options);
   }
 
   async downloadMessageMedia(channelId, messageId, options = {}) {
@@ -1590,6 +1757,13 @@ class TelegramClient {
   onChannelTooLong(listener) {
     this.updateEmitter.on('channelTooLong', listener);
     return () => this.updateEmitter.off('channelTooLong', listener);
+  }
+
+  // Listeners on the mtcute client die with it. Fires before the new client logs in,
+  // so whoever re-subscribes here is in time for its catch-up.
+  onClientReplaced(listener) {
+    this.updateEmitter.on('clientReplaced', listener);
+    return () => this.updateEmitter.off('clientReplaced', listener);
   }
 
   async startUpdates() {

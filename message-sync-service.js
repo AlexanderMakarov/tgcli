@@ -2,10 +2,12 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { setTimeout as delay } from 'timers/promises';
-import { Message, PeersIndex, _messageMediaFromTl } from '@mtcute/core';
-import { toggleChannelIdMark } from '@mtcute/core/utils.js';
-import { normalizeChannelId, summarizeMedia } from './telegram-client.js';
+import { Message, MtArgumentError, MtPeerNotFoundError, PeersIndex, _messageMediaFromTl, getMarkedPeerId } from '@mtcute/core';
+import { isChatGone, normalizeChannelId, summarizeMedia } from './telegram-client.js';
 import { resolveStoreDir, resolveStorePaths } from './core/store.js';
+import { parseRequiredWaitSeconds } from './core/send-utils.js';
+import { chatIdSql, isChatId } from './core/chat-key.js';
+import { toggleChannelIdMark } from '@mtcute/core/utils.js';
 import { SubscriptionHub } from './core/subscriptions.js';
 
 const DEFAULT_DB_PATH = resolveStorePaths(resolveStoreDir()).dbPath;
@@ -19,6 +21,37 @@ const JOB_STATUS = {
   IDLE: 'idle',
   ERROR: 'error',
 };
+// A repair Telegram refuses for good, such as in a chat the account has left.
+const REPAIR_STATUS = { ...JOB_STATUS, SKIPPED: 'skipped' };
+// A job or repair with work ahead of it: an error is retried when the server starts.
+const UNFINISHED_STATUSES = new Set([JOB_STATUS.PENDING, JOB_STATUS.IN_PROGRESS, JOB_STATUS.ERROR]);
+// Tables mergeChatKey moves by rules of their own rather than as plain copies.
+const MERGED_APART = new Set(['messages', 'message_links', 'message_media', 'jobs', 'archive_repairs']);
+// Out of reach for this long, Telegram's catch-up is no longer trusted to be complete.
+const LONG_OUTAGE_MS = 5 * 60 * 1000;
+const PERIODIC_CHECK_INTERVAL_MS = 30 * 1000;
+// How long after a message was named deleted or skipped to read it again.
+const RECHECK_AFTER_MS = [60 * 1000, 10 * 60 * 1000, 60 * 60 * 1000];
+// A message Telegram hides is a fresh one, so ids further than this from the cursor or
+// from the next message, and those next to older messages, are not checked.
+const RECHECK_MAX_ID_DISTANCE = 100;
+const RECHECK_RECENT_MS = 10 * 60 * 1000;
+// A read that keeps failing for this long, on a running server, is not going to work.
+const RECHECK_GIVE_UP_MS = 24 * 60 * 60 * 1000;
+const PERIODIC_RECONCILE_MS = 60 * 60 * 1000;
+// A chat missing from the dialog list but still joined is asked about again this often.
+const MEMBERSHIP_RECHECK_MS = 24 * 60 * 60 * 1000;
+const CONNECTION_CHECK_TIMEOUT_MS = 20 * 1000;
+const RETRY_BASE_MS = 60 * 1000;
+// A repair walks history one page per queue step, so jobs and gap fills never wait
+// behind it for long.
+const REPAIR_PAGE_SIZE = 100;
+const REPAIR_PAGE_DELAY_MS = 1000;
+const RETRY_MAX_MS = 60 * 60 * 1000;
+// A username Telegram did not find is asked about again after this long.
+const USERNAME_RECHECK_MS = 24 * 60 * 60 * 1000;
+// Marked channel ids are below this. A text prefix would also match some basic groups.
+const MAX_MARKED_CHANNEL_ID = -1000000000000;
 const URL_PATTERN = /https?:\/\/[^\s<>"')]+/giu;
 const FILE_NAME_PATTERN = /\b[\w.\-]+\.[a-z0-9]{2,7}\b/iu;
 const MAX_FILENAME_SCAN_DEPTH = 5;
@@ -214,6 +247,61 @@ function normalizeIncomingTitle(title) {
   if (typeof title !== 'string') return null;
   const trimmed = title.trim();
   return trimmed && trimmed !== 'Unknown' ? trimmed : null;
+}
+
+// A username gets here only through resolveChatKey, which turns it into the id.
+function chatIdForWrite(channelId) {
+  const key = normalizeChannelKey(channelId);
+  if (!isChatId(key)) {
+    throw new Error(`Chat ${key} has to be resolved to its Telegram id before it is archived.`);
+  }
+  return key;
+}
+
+const USERNAME_NOT_FOUND_ERRORS = new Set(['USERNAME_INVALID', 'USERNAME_NOT_OCCUPIED']);
+
+function isChatNotFound(error) {
+  // mtcute says the same of a chat it found but cannot reach yet, which passes.
+  if (error instanceof MtPeerNotFoundError && /no access hash/.test(error.message ?? '')) {
+    return false;
+  }
+  return error instanceof MtArgumentError || USERNAME_NOT_FOUND_ERRORS.has(error?.text) || isChatGone(error);
+}
+
+function chatNotFound(key, cause) {
+  const error = new Error(`Telegram has no chat ${key}.`, { cause });
+  error.code = 'CHAT_NOT_FOUND';
+  return error;
+}
+
+// Whether Telegram's answer for a username is the chat that has it now. mtcute answers
+// from its own cache first, which can still name the account that had it before.
+function peerHasUsername(peer, key) {
+  const wanted = key.replace(/^@/, '').toLowerCase();
+  if (wanted === 'me' || wanted === 'self') {
+    return true;
+  }
+  const names = (peer?.usernames ?? []).map((entry) => entry.username?.toLowerCase());
+  return names.includes(wanted) || peer?.username?.toLowerCase() === wanted;
+}
+
+// Only in channels and supergroups, private chats and basic groups share them.
+function hasSequentialIds(channelId) {
+  return Number(channelId) <= MAX_MARKED_CHANNEL_ID;
+}
+
+// Telegram refusing this chat will not change soon, unlike a dropped connection, an
+// expired session (401) or a failure of its own (5xx), which say nothing about the message.
+function isRefusedRead(error) {
+  const code = error?.code;
+  return (code >= 400 && code < 500 && code !== 401) || error instanceof MtPeerNotFoundError;
+}
+
+// mtcute builds the message of an updateShortSentMessage from the response alone,
+// which has no reply header and no link preview. Telegram answers that way only to
+// text sent outside channels, so any such send may need a full copy afterwards.
+function mayLackFullContent(message) {
+  return message.raw?.peerId?._ !== 'peerChannel' && !message.raw?.media;
 }
 
 function normalizePeerType(peer) {
@@ -563,16 +651,43 @@ export default class MessageSyncService {
     this.batchSize = options.batchSize || 100;
     this.interJobDelayMs = options.interJobDelayMs || 3000;
     this.interBatchDelayMs = options.interBatchDelayMs || 1000;
+    this.repairPageDelayMs = options.repairPageDelayMs ?? REPAIR_PAGE_DELAY_MS;
+    // ServerStats of the running server; see core/server-stats.js.
+    this.stats = options.stats ?? null;
     this.processing = false;
     this.stopRequested = false;
+    this.recheckingMessages = false;
     this.realtimeActive = false;
     this.realtimeHandlers = null;
     this.unsubscribeChannelTooLong = null;
+    this.unsubscribeClientReplaced = null;
+    // Channels whose gap failed, as { attempts, retryAt }. The gap stays recorded, and
+    // the queue gets on with other work instead of spinning on it.
+    this.gapRetries = new Map();
+    this.gapRetryTimer = null;
+    // Until the next comparison with the dialog list, and from the first sign of a lost
+    // connection until Telegram answers again, updates leave last_message_id where it is.
+    this.reconcileNeeded = false;
+    this.reconcilePromise = null;
+    this.reconcileAgain = false;
+    this.disconnectedAt = null;
+    this.disconnectCount = 0;
+    this.confirmingConnection = false;
+    this.lastCheckAt = Date.now();
+    this.lastErroredJobsRetryAt = Date.now();
+    this.lastReconcileAt = Date.now();
+    this.periodicCheckTimer = null;
     // Id of the job this instance set to `in_progress` while running the queue.
     // Only the queue worker owns its in-flight job; `shutdown()` requeues just
     // this one so it resumes next run, without touching jobs other processes own.
     this.ownedInProgressJobId = null;
     this.subscriptions = new SubscriptionHub();
+    // The run of migrateUsernameKeys under way, which the queue waits for, and the
+    // queue's step in flight, which the migration waits for.
+    this.usernameKeyMigration = null;
+    this.queueStep = null;
+    // Peers resolveChatKey found by username, by id, until a write describes the chat.
+    this.resolvedPeers = new Map();
 
     this._initDatabase();
   }
@@ -585,6 +700,9 @@ export default class MessageSyncService {
 
     this.db = new Database(this.dbPath);
     this.db.pragma('journal_mode = WAL');
+    const newArchive = !this.db.prepare(`
+      SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'
+    `).get();
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS channels (
@@ -599,6 +717,13 @@ export default class MessageSyncService {
         last_message_date TEXT,
         oldest_message_id INTEGER,
         oldest_message_date TEXT,
+        gap_after_message_id INTEGER,
+        newer_sync_pending INTEGER NOT NULL DEFAULT 0,
+        in_dialogs INTEGER,
+        sync_off_reason TEXT,
+        membership TEXT,
+        membership_checked_at INTEGER,
+        sync_by_user INTEGER,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
@@ -653,6 +778,26 @@ export default class MessageSyncService {
 
     this._ensureChannelColumn('chat_type', 'TEXT');
     this._ensureChannelColumn('is_forum', 'INTEGER');
+    this._ensureChannelColumn('gap_after_message_id', 'INTEGER');
+    // 1 when the last full dialog list had the chat, 0 when it did not, NULL before any.
+    this._ensureChannelColumn('in_dialogs', 'INTEGER');
+    // 'left' when the server turned sync off because Telegram said the account left.
+    this._ensureChannelColumn('sync_off_reason', 'TEXT');
+    // What Telegram last said about a chat missing from the dialog list ('member', 'left',
+    // 'gone' or 'unknown'), and when (ms).
+    this._ensureChannelColumn('membership', 'TEXT');
+    this._ensureChannelColumn('membership_checked_at', 'INTEGER');
+    // 1 when the user asked for the chat (channels watch, backfill --chat): a public
+    // channel can be archived without joining it, and Telegram calls that left.
+    this._ensureChannelColumn('sync_by_user', 'INTEGER');
+    if (this._ensureChannelColumn('newer_sync_pending', 'INTEGER NOT NULL DEFAULT 0')) {
+      // Jobs queued before this column existed still have their newer sync ahead of them.
+      this.db.prepare(`
+        UPDATE channels
+        SET newer_sync_pending = 1
+        WHERE channel_id IN (SELECT channel_id FROM jobs WHERE status != ?)
+      `).run(JOB_STATUS.IDLE);
+    }
     this._ensureJobColumn('target_message_count', `INTEGER DEFAULT ${DEFAULT_TARGET_MESSAGES}`);
     this._ensureJobColumn('message_count', 'INTEGER DEFAULT 0');
     this._ensureJobColumn('cursor_message_id', 'INTEGER');
@@ -744,6 +889,60 @@ export default class MessageSyncService {
     this._ensureMessageColumn('topic', 'TEXT');
 
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS sent_messages_to_refetch (
+        channel_id TEXT NOT NULL,
+        message_id INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, message_id)
+      );
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS messages_to_recheck (
+        channel_id TEXT NOT NULL,
+        message_id INTEGER NOT NULL,
+        queued_at INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (channel_id, message_id)
+      );
+    `);
+
+    // One repair per chat: a walk of its history from the newest message down to a
+    // bound, writing back what the archive lacks. cursor_message_id is where the
+    // next page starts, so a restarted server carries on. A dry run writes nothing and
+    // counts in added_count what it would have added.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS archive_repairs (
+        channel_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        after_message_id INTEGER NOT NULL DEFAULT 0,
+        since_date INTEGER,
+        cursor_message_id INTEGER,
+        checked_count INTEGER NOT NULL DEFAULT 0,
+        added_count INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        generation INTEGER NOT NULL DEFAULT 0,
+        dry_run INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    if (!this.db.prepare('PRAGMA table_info(archive_repairs)').all().some((col) => col.name === 'dry_run')) {
+      this.db.exec('ALTER TABLE archive_repairs ADD COLUMN dry_run INTEGER NOT NULL DEFAULT 0');
+    }
+
+    // Chats still stored under a username that the last try could not move to their
+    // Telegram id, and why: Telegram did not find it, the try failed, or the messages
+    // under it name another chat than the one Telegram gave.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS username_key_checks (
+        chat_key TEXT PRIMARY KEY,
+        outcome TEXT NOT NULL,
+        detail TEXT,
+        checked_at INTEGER NOT NULL
+      );
+    `);
+
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS message_links (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         channel_id TEXT NOT NULL,
@@ -822,6 +1021,9 @@ export default class MessageSyncService {
         value TEXT
       );
     `);
+    if (newArchive) {
+      this._setRepairNotNeeded('archive started with the fixes');
+    }
 
     const searchSchema = this.db.prepare(`
       SELECT sql FROM sqlite_master
@@ -1256,9 +1458,11 @@ export default class MessageSyncService {
 
   _ensureChannelColumn(column, definition) {
     const existing = this.db.prepare('PRAGMA table_info(channels)').all();
-    if (!existing.some((col) => col.name === column)) {
-      this.db.exec(`ALTER TABLE channels ADD COLUMN ${column} ${definition}`);
+    if (existing.some((col) => col.name === column)) {
+      return false;
     }
+    this.db.exec(`ALTER TABLE channels ADD COLUMN ${column} ${definition}`);
+    return true;
   }
 
   _ensureMessageColumn(column, definition) {
@@ -1276,14 +1480,227 @@ export default class MessageSyncService {
   }
 
   async refreshChannelsFromDialogs() {
-    const dialogs = await this.telegramClient.listDialogs(0);
+    const dialogs = await this.telegramClient.listDialogs(0, { includeArchived: true });
     this.upsertChannels(dialogs);
+    this._markDialogMembership(dialogs);
+    this._restoreReturnedChats();
+    this._markGapsBehindDialogs(dialogs);
     return dialogs.length;
   }
 
+  // A chat whose sync the server turned off when the account left is back in the dialog
+  // list: the account rejoined. Sync comes back, and the gap behind the cursor is filled.
+  _restoreReturnedChats() {
+    const returned = this.db.prepare(`
+      UPDATE channels
+      SET sync_enabled = 1, sync_off_reason = NULL, membership = NULL, membership_checked_at = NULL,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE sync_off_reason = 'left' AND in_dialogs = 1
+      RETURNING channel_id
+    `).all().map((row) => row.channel_id);
+    if (returned.length) {
+      console.log(`[sync] ${returned.length} chat(s) the account had left are back in the dialog list, sync is on again: ${returned.join(', ')}.`);
+    }
+  }
+
+  // Telegram sends nothing from a channel or group the account has left, so the archive
+  // cannot keep up with it. Missing from the dialog list is only a reason to ask: sync goes
+  // off only when Telegram says the account left or was removed, or the chat is gone. One
+  // still joined keeps its sync and is asked about again a day later. Private chats are not
+  // asked about: their messages arrive without a dialog. Nor are chats the user asked for.
+  checkChatsMissingFromDialogs() {
+    // Two comparisons close together share one round of questions.
+    if (!this.membershipCheckPromise) {
+      this.membershipCheckPromise = this._checkChatsMissingFromDialogs().finally(() => {
+        this.membershipCheckPromise = null;
+      });
+    }
+    return this.membershipCheckPromise;
+  }
+
+  async _checkChatsMissingFromDialogs() {
+    const dueBefore = Date.now() - MEMBERSHIP_RECHECK_MS;
+    const missing = this.db.prepare(`
+      SELECT channel_id FROM channels
+      WHERE sync_enabled = 1 AND in_dialogs = 0 AND COALESCE(sync_by_user, 0) = 0
+        AND channel_id GLOB '-[0-9]*' AND channel_id NOT GLOB '-*[^0-9]*'
+        AND (membership_checked_at IS NULL OR membership_checked_at < ?)
+      ORDER BY channel_id
+    `).all(dueBefore).map((row) => row.channel_id);
+    if (!missing.length) {
+      return null;
+    }
+    const membership = await this.telegramClient.getChatMembership(missing);
+    const counts = { off: 0, member: 0, unknown: 0 };
+    const now = Date.now();
+    const turnOff = this.db.prepare(`
+      UPDATE channels
+      SET sync_enabled = 0, sync_off_reason = 'left', membership = ?, membership_checked_at = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE channel_id = ? AND sync_enabled = 1 AND in_dialogs = 0 AND COALESCE(sync_by_user, 0) = 0
+    `);
+    const checked = this.db.prepare('UPDATE channels SET membership = ?, membership_checked_at = ? WHERE channel_id = ?');
+    const stillJoined = [];
+    this.db.transaction(() => {
+      for (const channelId of missing) {
+        const state = membership.get(channelId) ?? 'unknown';
+        if (state === 'left' || state === 'gone') {
+          counts.off += turnOff.run(state, now, channelId).changes;
+        } else {
+          checked.run(state, now, channelId);
+          counts[state === 'member' ? 'member' : 'unknown'] += 1;
+          if (state === 'member') {
+            stillJoined.push(channelId);
+          }
+        }
+      }
+    })();
+    console.log(`[sync] ${missing.length} synced chat(s) are missing from the dialog list: sync off for ${counts.off} the account left, ${counts.member} still joined, ${counts.unknown} unknown.`);
+    if (stillJoined.length) {
+      console.warn(`[sync] Missing from the dialog list but still joined, sync stays on: ${stillJoined.join(', ')}.`);
+    }
+    return counts;
+  }
+
+  // A chat missing from the full dialog list is one the account left or lost: Telegram
+  // sends no updates for it, and the archive can no longer keep up with it. An empty list
+  // proves nothing, so it changes nothing.
+  _markDialogMembership(dialogs) {
+    if (!dialogs.length) {
+      return;
+    }
+    // A chat back in the list says nothing more about whether the account is still in it
+    // later, so what Telegram said while it was missing goes.
+    this.db.prepare(`
+      WITH listed AS (SELECT value AS channel_id FROM json_each(?))
+      UPDATE channels
+      SET in_dialogs = channel_id IN (SELECT channel_id FROM listed),
+          membership = CASE WHEN channel_id IN (SELECT channel_id FROM listed) THEN NULL ELSE membership END,
+          membership_checked_at = CASE WHEN channel_id IN (SELECT channel_id FROM listed) THEN NULL ELSE membership_checked_at END
+    `).run(JSON.stringify(dialogs.map((dialog) => String(dialog.id))));
+  }
+
+  // Catch-up cannot report everything: updates.differenceTooLong moves the pts without
+  // handing over a single message, and a channel is only fetched if Telegram names it.
+  // A dialog whose newest message is above the cursor shows what was left behind, as
+  // long as no update has moved that cursor since the outage: _cursorsHeld sees to that,
+  // from before the first update until this comparison is done. A chat that catch-up did
+  // bring up to date gets one needless history page, which the archive ignores. Runs
+  // until it succeeds, so a failed dialog list cannot leave a hole unnoticed.
+  reconcileWithDialogs() {
+    if (this.reconcilePromise) {
+      this.reconcileAgain = true;
+      return this.reconcilePromise;
+    }
+    this.reconcilePromise = this._reconcileUntilDone();
+    return this.reconcilePromise;
+  }
+
+  async _reconcileUntilDone() {
+    let dialogCount = null;
+    let retryMs = RETRY_BASE_MS;
+    try {
+      do {
+        this.reconcileAgain = false;
+        try {
+          dialogCount = await this.refreshChannelsFromDialogs();
+        } catch (error) {
+          if (this.stopRequested) {
+            return null;
+          }
+          console.error(`[sync] Could not compare the archive with the dialog list, retrying in ${retryMs / 1000}s: ${error?.message ?? error}`);
+          await this._delayUnlessStopped(retryMs);
+          retryMs = Math.min(retryMs * 2, RETRY_MAX_MS);
+          this.reconcileAgain = true;
+        }
+      } while (this.reconcileAgain && !this.stopRequested);
+      this.reconcileNeeded = false;
+      this.lastReconcileAt = Date.now();
+      if (!this.stopRequested) {
+        // After the comparison, so its requests do not hold the cursors any longer.
+        void this.checkChatsMissingFromDialogs().catch((error) => {
+          console.error(`[sync] Could not ask Telegram about chats missing from the dialog list: ${error?.message ?? error}`);
+        });
+      }
+      return this.stopRequested ? null : dialogCount;
+    } finally {
+      // In the same tick as the last look at reconcileAgain, so no request falls between.
+      this.reconcilePromise = null;
+    }
+  }
+
+  _markGapsBehindDialogs(dialogs) {
+    const behind = dialogs
+      .filter((dialog) => {
+        const channelId = String(dialog.id);
+        const lastMessageId = this._getChannel(channelId)?.last_message_id;
+        return lastMessageId > 0 && dialog.topMessageId > lastMessageId && this._markChannelGap(channelId);
+      })
+      .map((dialog) => dialog.id);
+    if (behind.length) {
+      console.log(`[sync] ${behind.length} of ${dialogs.length} dialogs are ahead of the archive: ${behind.join(', ')}.`);
+    }
+  }
+
+  // Everything above the cursor may be missing from here on, wherever the cursor goes
+  // next. An existing gap keeps its start, which is the lower of the two. A chat with no
+  // cursor has nothing to be continuous with, so it gets no gap: returns whether it did.
+  _markChannelGap(channelId) {
+    const { changes } = this.db.prepare(`
+      UPDATE channels
+      SET gap_after_message_id = COALESCE(gap_after_message_id, last_message_id),
+          updated_at = CURRENT_TIMESTAMP
+      WHERE channel_id = ? AND sync_enabled = 1 AND last_message_id > 0
+    `).run(channelId);
+    return changes > 0;
+  }
+
+  _setChannelGapStart(channelId, messageId) {
+    this.db.prepare(`
+      UPDATE channels SET gap_after_message_id = ?, updated_at = CURRENT_TIMESTAMP WHERE channel_id = ?
+    `).run(messageId, channelId);
+  }
+
+  _closeChannelGap(channelId) {
+    this._setChannelGapStart(channelId, null);
+  }
+
+  _getGapChannelIds() {
+    return this.db.prepare(`
+      SELECT channel_id FROM channels
+      WHERE gap_after_message_id IS NOT NULL AND sync_enabled = 1 AND ${chatIdSql()}
+      ORDER BY channel_id
+    `).all().map((row) => row.channel_id);
+  }
+
+  _getNextGapChannelId() {
+    const now = Date.now();
+    return this._getGapChannelIds().find((id) => (this.gapRetries.get(id)?.retryAt ?? 0) <= now) ?? null;
+  }
+
+  // Everything left has failed recently, so wake the queue when the first retry is due.
+  _scheduleNextGapRetry() {
+    const gapChannelIds = this._getGapChannelIds();
+    if (!gapChannelIds.length) {
+      return;
+    }
+    const nextRetryAt = Math.min(...gapChannelIds.map((id) => this.gapRetries.get(id).retryAt));
+    clearTimeout(this.gapRetryTimer);
+    this.gapRetryTimer = setTimeout(() => {
+      void this.processQueue();
+    }, nextRetryAt - Date.now());
+    this.gapRetryTimer.unref?.();
+  }
+
   upsertChannels(dialogs = []) {
+    // The dialog list is the whole truth about a chat's username: one it no longer shows
+    // is gone, or reads by username would keep finding the chat under it.
+    const clearUsername = this.db.prepare('UPDATE channels SET username = NULL WHERE channel_id = ? AND username IS NOT NULL');
     const tx = this.db.transaction((items) => {
       for (const dialog of items) {
+        if (!dialog.username) {
+          clearUsername.run(String(dialog.id));
+        }
         this.upsertChannelStmt.get({
           channel_id: String(dialog.id),
           peer_title: normalizeIncomingTitle(dialog.title),
@@ -1299,7 +1716,7 @@ export default class MessageSyncService {
   }
 
   upsertTopics(channelId, topics = []) {
-    const normalizedId = normalizeChannelKey(channelId);
+    const normalizedId = chatIdForWrite(channelId);
     const entries = [];
     for (const topic of topics || []) {
       const id = typeof topic.id === 'number' ? topic.id : Number(topic.id);
@@ -1328,22 +1745,28 @@ export default class MessageSyncService {
   }
 
   setChannelSync(channelId, enabled) {
-    const normalizedId = normalizeChannelKey(channelId);
+    const normalizedId = chatIdForWrite(channelId);
     const value = enabled ? 1 : 0;
     const stmt = this.db.prepare(`
-      INSERT INTO channels (channel_id, sync_enabled, updated_at)
-      VALUES (?, ?, CURRENT_TIMESTAMP)
+      INSERT INTO channels (channel_id, sync_enabled, sync_by_user, updated_at)
+      VALUES (?, ?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(channel_id) DO UPDATE SET
         sync_enabled = excluded.sync_enabled,
+        sync_by_user = excluded.sync_by_user,
+        sync_off_reason = NULL,
+        membership = NULL,
+        membership_checked_at = NULL,
         updated_at = CURRENT_TIMESTAMP
       RETURNING channel_id, sync_enabled;
     `);
 
-    return stmt.get(normalizedId, value);
+    const row = stmt.get(normalizedId, value, value);
+    this._describeResolvedChat(normalizedId);
+    return row;
   }
 
   setChannelTags(channelId, tags, options = {}) {
-    const normalizedId = normalizeChannelKey(channelId);
+    const normalizedId = chatIdForWrite(channelId);
     const source = options.source ? String(options.source) : 'manual';
     const uniqueTags = new Set();
     for (const tag of tags || []) {
@@ -1359,6 +1782,7 @@ export default class MessageSyncService {
       VALUES (?, CURRENT_TIMESTAMP)
       ON CONFLICT(channel_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
     `).run(normalizedId);
+    this._describeResolvedChat(normalizedId);
 
     this.setChannelTagsTx(normalizedId, source, finalTags);
     return finalTags.map((entry) => entry.tag);
@@ -1670,9 +2094,12 @@ export default class MessageSyncService {
     const onlyMissing = Boolean(options.onlyMissing);
     const channelIds = Array.isArray(options.channelIds) ? options.channelIds : null;
 
+    // A chat under a username waits for migrateUsernameKeys, which would find these
+    // writes back under the username after it moved the rest.
     let rows;
     if (channelIds && channelIds.length) {
-      rows = channelIds.map((id) => this._getChannelWithMetadata(normalizeChannelKey(id))).filter(Boolean);
+      rows = channelIds.map((id) => this._getChannelWithMetadata(normalizeChannelKey(id)))
+        .filter((row) => row && isChatId(row.channel_id));
     } else {
       rows = this.db.prepare(`
         SELECT
@@ -1686,6 +2113,7 @@ export default class MessageSyncService {
           channel_metadata.updated_at AS metadata_updated_at
         FROM channels
         LEFT JOIN channel_metadata ON channel_metadata.channel_id = channels.channel_id
+        WHERE ${chatIdSql('channels.channel_id')}
         ORDER BY channels.updated_at DESC
         LIMIT ?
       `).all(limit);
@@ -1749,7 +2177,8 @@ export default class MessageSyncService {
 
     let rows;
     if (channelIds && channelIds.length) {
-      rows = channelIds.map((id) => this._getChannelWithMetadata(normalizeChannelKey(id))).filter(Boolean);
+      rows = channelIds.map((id) => this._getChannelWithMetadata(normalizeChannelKey(id)))
+        .filter((row) => row && isChatId(row.channel_id));
     } else {
       rows = this.db.prepare(`
         SELECT
@@ -1761,6 +2190,7 @@ export default class MessageSyncService {
           channel_metadata.updated_at AS metadata_updated_at
         FROM channels
         LEFT JOIN channel_metadata ON channel_metadata.channel_id = channels.channel_id
+        WHERE ${chatIdSql('channels.channel_id')}
         ORDER BY channels.updated_at DESC
         LIMIT ?
       `).all(limit);
@@ -1832,16 +2262,25 @@ export default class MessageSyncService {
   }
 
   addJob(channelId, options = {}) {
-    const normalizedId = normalizeChannelKey(channelId);
+    const normalizedId = chatIdForWrite(channelId);
     const target = options.depth && options.depth > 0 ? Number(options.depth) : DEFAULT_TARGET_MESSAGES;
     const minDate = options.minDate ? parseIsoDate(options.minDate) : null;
     const minDateIso = minDate ? new Date(minDate * 1000).toISOString() : null;
 
+    // Stays set until a newer sync reaches the newest message, even if this job is canceled
+    // with a cursor in place: what lies above that cursor is still to be fetched. Asking for
+    // the chat is the user's word on it, over the server turning its sync off.
     this.db.prepare(`
-      INSERT INTO channels (channel_id, updated_at)
-      VALUES (?, CURRENT_TIMESTAMP)
-      ON CONFLICT(channel_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+      INSERT INTO channels (channel_id, newer_sync_pending, sync_by_user, updated_at)
+      VALUES (?, 1, 1, CURRENT_TIMESTAMP)
+      ON CONFLICT(channel_id) DO UPDATE SET
+        newer_sync_pending = 1,
+        sync_by_user = 1,
+        sync_enabled = CASE WHEN sync_off_reason = 'left' THEN 1 ELSE sync_enabled END,
+        sync_off_reason = NULL,
+        updated_at = CURRENT_TIMESTAMP
     `).run(normalizedId);
+    this._describeResolvedChat(normalizedId);
 
     const stmt = this.db.prepare(`
       INSERT INTO jobs (
@@ -1868,6 +2307,20 @@ export default class MessageSyncService {
     return stmt.get(normalizedId, target, minDateIso);
   }
 
+  // What arrived while a chat was off still has to be fetched. Queues a job, keeping
+  // the depth of an earlier one, unless one is already waiting or running.
+  queueResyncJob(channelId) {
+    const [existing] = this.listJobs({ channelId, limit: 1 });
+    if (existing?.status === JOB_STATUS.PENDING || existing?.status === JOB_STATUS.IN_PROGRESS) {
+      return { job: existing, queued: false };
+    }
+    const job = existing
+      ? this.addJob(channelId, { depth: existing.target_message_count, minDate: existing.backfill_min_date })
+      : this.addJob(channelId);
+    void this.processQueue();
+    return { job, queued: true };
+  }
+
   listJobs(options = {}) {
     const status = options.status ? String(options.status) : null;
     const channelId = options.channelId ? normalizeChannelKey(options.channelId) : null;
@@ -1880,9 +2333,13 @@ export default class MessageSyncService {
       params.push(status);
     }
 
-    if (channelId) {
+    if (channelId && isChatId(channelId)) {
       clauses.push('jobs.channel_id = ?');
       params.push(channelId);
+    } else if (channelId) {
+      // This reads without Telegram, so a username matches the archive's copy of it.
+      clauses.push('(jobs.channel_id = ? OR (channels.username IS NOT NULL AND LOWER(channels.username) = LOWER(?)))');
+      params.push(channelId, channelId.replace(/^@/, ''));
     }
 
     const whereClause = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -1930,15 +2387,17 @@ export default class MessageSyncService {
       throw new Error('jobId must be a number.');
     }
 
+    // A job under a username would only wait in the queue, and keep the server from
+    // exiting or making way for a newer version, until migrateUsernameKeys moves it.
     let ids = [];
     if (allErrors) {
       ids = this.db.prepare(`
         SELECT id
         FROM jobs
-        WHERE status = ?
+        WHERE status = ? AND ${chatIdSql()}
       `).all(JOB_STATUS.ERROR).map((row) => row.id);
     } else if (jobId !== null) {
-      const row = this.db.prepare('SELECT id FROM jobs WHERE id = ?').get(jobId);
+      const row = this.db.prepare(`SELECT id FROM jobs WHERE id = ? AND ${chatIdSql()}`).get(jobId);
       if (row) {
         ids = [row.id];
       }
@@ -1946,7 +2405,7 @@ export default class MessageSyncService {
       ids = this.db.prepare(`
         SELECT id
         FROM jobs
-        WHERE channel_id = ?
+        WHERE channel_id = ? AND ${chatIdSql()}
       `).all(channelId).map((row) => row.id);
     }
 
@@ -2001,6 +2460,15 @@ export default class MessageSyncService {
       for (const id of entries) {
         this.db.prepare('DELETE FROM jobs WHERE id = ?').run(id);
       }
+      // With no cursor there is nothing to resume from, and the flag would only keep
+      // updates from ever setting one.
+      this.db.prepare(`
+        UPDATE channels
+        SET newer_sync_pending = 0, updated_at = CURRENT_TIMESTAMP
+        WHERE newer_sync_pending = 1
+          AND COALESCE(last_message_id, 0) = 0
+          AND channel_id NOT IN (SELECT channel_id FROM jobs)
+      `).run();
     });
     tx(ids);
 
@@ -2046,6 +2514,7 @@ export default class MessageSyncService {
     return {
       processing: this.processing,
       ...stats,
+      gaps: this._getGapChannelIds().length,
     };
   }
 
@@ -2063,6 +2532,425 @@ export default class MessageSyncService {
     };
   }
 
+  // The one place a chat given by username (or 'me') becomes the key the archive keeps
+  // it under, its Telegram id. An id comes back as it is, without asking Telegram.
+  async resolveChatKey(chat) {
+    const key = normalizeChannelKey(chat);
+    if (isChatId(key)) {
+      return key;
+    }
+    if (!key) {
+      throw new Error('A chat id or username is required.');
+    }
+    const peer = await this._getPeerByUsername(key);
+    const id = String(peer.id);
+    // A job or watch about to be written fills in the chat's title, type and username,
+    // which nothing else may bring in for a chat outside the dialog list.
+    this.resolvedPeers.delete(id);
+    this.resolvedPeers.set(id, peer);
+    if (this.resolvedPeers.size > 100) {
+      this.resolvedPeers.delete(this.resolvedPeers.keys().next().value);
+    }
+    return id;
+  }
+
+  // Reads by username find the chat without Telegram, as the archive did before: by the
+  // username the archive keeps for its chats, then by mtcute's peer cache. Only a username
+  // neither knows goes to Telegram. Writes go through resolveChatKey, which asks Telegram,
+  // since a username changes hands and a stored one can be stale.
+  async resolveChatKeyForRead(chat) {
+    return (await this.findChatKeyLocally(chat)) ?? this.resolveChatKey(chat);
+  }
+
+  // The chat id a username or 'me' names here, or null when nothing local knows it or two
+  // chats here have it and nothing local tells them apart.
+  async findChatKeyLocally(chat) {
+    const key = normalizeChannelKey(chat);
+    if (isChatId(key)) {
+      return key;
+    }
+    const name = key.replace(/^@/, '').trim();
+    const lower = name.toLowerCase();
+    if (!name) {
+      return null;
+    }
+    const storage = this.telegramClient?.client?.storage;
+    if (lower === 'me' || lower === 'self') {
+      const self = await Promise.resolve(storage?.self?.fetch?.()).catch(() => null);
+      return self?.userId ? String(self.userId) : null;
+    }
+    const archived = this.db.prepare(`
+      SELECT channel_id, in_dialogs FROM channels
+      WHERE username IS NOT NULL AND LOWER(username) = ? AND ${chatIdSql()}
+    `).all(lower);
+    if (archived.length === 1) {
+      return archived[0].channel_id;
+    }
+    const inDialogs = archived.filter((row) => row.in_dialogs === 1);
+    if (inDialogs.length === 1) {
+      return inDialogs[0].channel_id;
+    }
+    try {
+      const peer = await storage?.peers?.getByUsername?.(name);
+      return peer ? String(getMarkedPeerId(peer)) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  _describeResolvedChat(channelId) {
+    const peer = this.resolvedPeers.get(channelId);
+    if (peer) {
+      this.resolvedPeers.delete(channelId);
+      this._ensureChannelFromPeer(channelId, peer);
+    }
+  }
+
+  async _getPeerByUsername(key) {
+    const client = this.telegramClient.client;
+    try {
+      const peer = await client.getPeer(key);
+      if (peerHasUsername(peer, key)) {
+        return peer;
+      }
+      return await client.getPeer(await client.resolvePeer(key, true));
+    } catch (error) {
+      throw isChatNotFound(error) ? chatNotFound(key, error) : error;
+    }
+  }
+
+  // Chats kept under a username instead of their Telegram id, as older versions
+  // stored a chat asked for that way. archivedAs is a chat under an id that has the
+  // same username, most likely the same chat; lastCheck says why the last try left it.
+  listUsernameKeyedChats() {
+    const keys = new Set();
+    for (const table of this._chatKeyedTables()) {
+      // A username sorts after every id, or before them when it starts with a sign
+      // other than '-', so the two ranges read only an index.
+      const rows = this.db.prepare(`
+        SELECT channel_id FROM "${table}" WHERE channel_id < '-'
+        UNION SELECT channel_id FROM "${table}" WHERE channel_id >= ':'
+      `).all();
+      for (const row of rows) {
+        keys.add(row.channel_id);
+      }
+    }
+    // Every way in leaves a job or a chat row, and both tables are small enough to
+    // check whole, which also finds a key such as '1a'.
+    for (const table of ['channels', 'jobs']) {
+      for (const row of this.db.prepare(`SELECT channel_id FROM ${table} WHERE NOT (${chatIdSql()})`).all()) {
+        keys.add(row.channel_id);
+      }
+    }
+    const checks = new Map(this.db.prepare('SELECT * FROM username_key_checks').all().map((row) => [row.chat_key, row]));
+    const countMessages = this.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE channel_id = ?');
+    const findById = this.db.prepare(`
+      SELECT channel_id FROM channels
+      WHERE username IS NOT NULL AND LOWER(username) = LOWER(?) AND ${chatIdSql()}
+      ORDER BY channel_id
+      LIMIT 1
+    `);
+    return [...keys].sort().map((key) => {
+      const check = checks.get(key);
+      return {
+        key,
+        messages: countMessages.get(key).n,
+        archivedAs: findById.get(key.replace(/^@/, ''))?.channel_id ?? null,
+        lastCheck: check
+          ? { outcome: check.outcome, detail: check.detail, checkedAt: new Date(check.checked_at).toISOString() }
+          : null,
+      };
+    });
+  }
+
+  // Moves each chat still stored under a username to its Telegram id, which it asks
+  // Telegram for. The server runs this after every login, before the queue resumes,
+  // so an update brings an archive over without anyone running anything. A chat that
+  // Telegram does not find, or whose messages name another chat than the one Telegram
+  // gives, stays as it is with its work parked, and `tgcli doctor` names it.
+  migrateUsernameKeys({ now = Date.now() } = {}) {
+    this.usernameKeyMigration ??= this._migrateUsernameKeys(now).finally(() => {
+      this.usernameKeyMigration = null;
+    });
+    return this.usernameKeyMigration;
+  }
+
+  async _migrateUsernameKeys(now) {
+    const report = { moved: [], left: [], dropped: [] };
+    const chats = this.listUsernameKeyedChats();
+    if (!chats.length) {
+      return report;
+    }
+    console.log(`[archive] ${chats.length} chat(s) stored under a username, moving them to their Telegram ids.`);
+    for (const { key, lastCheck } of chats) {
+      if (this.stopRequested) {
+        break;
+      }
+      const left = (outcome, detail) => {
+        report.left.push({ key, outcome, detail });
+        console.log(`[archive] Chat ${key} stays under its username: ${detail}.`);
+        this._parkUsernameKey(key, outcome, detail, now);
+      };
+      // Telegram's answer to these does not change from one start to the next, and
+      // it limits how often a username can be looked up.
+      const recent = ['not_found', 'conflict'].includes(lastCheck?.outcome)
+        && now - Date.parse(lastCheck.checkedAt) < USERNAME_RECHECK_MS;
+      if (recent && lastCheck.outcome === 'conflict') {
+        report.left.push({ key, outcome: lastCheck.outcome, detail: lastCheck.detail });
+        continue;
+      }
+      let peer = null;
+      if (!recent) {
+        try {
+          peer = await this._getPeerByUsername(key);
+        } catch (error) {
+          if (this.stopRequested) {
+            break;
+          }
+          if (error?.code !== 'CHAT_NOT_FOUND') {
+            left('failed', `Telegram did not answer: ${error?.message ?? error}`);
+            continue;
+          }
+        }
+        if (this.stopRequested) {
+          break;
+        }
+      }
+      // One chat that cannot be moved, say with the archive busy, leaves the rest to go on.
+      let channelId = peer ? String(peer.id) : null;
+      try {
+        // Each message records the chat it came from. A username that has changed
+        // hands since would bring them into the chat that has it now.
+        const fromMessages = this._chatsOfMessages(key);
+        if (!peer) {
+          // Telegram no longer knows the username, so only the archive's own records can
+          // say which chat it was. A username stored on a chat has no date and may have
+          // belonged to someone else, so it is no evidence.
+          if (!fromMessages.total) {
+            const dropped = this.dropChatKey(key);
+            report.dropped.push(dropped);
+            console.log(`[archive] Chat ${key}: Telegram did not find it and no message is archived under it, so its rows are dropped: ${dropped.jobs} job(s), ${dropped.repairs} repair(s), ${dropped.rows} row(s) in all.`);
+            continue;
+          }
+          if (fromMessages.chats.size !== 1 || fromMessages.withPeer !== fromMessages.total) {
+            if (!recent) {
+              left('not_found', 'Telegram did not find it, and its messages do not all name one chat');
+            } else {
+              report.left.push({ key, outcome: lastCheck.outcome, detail: lastCheck.detail });
+            }
+            continue;
+          }
+          channelId = [...fromMessages.chats.keys()][0];
+        } else {
+          const others = [...fromMessages.chats.keys()].filter((id) => id !== channelId);
+          if (others.length) {
+            left('conflict', `Telegram gives ${channelId} for it, but its messages are from ${others.join(', ')}`);
+            continue;
+          }
+        }
+        // A queue started before this, by an update during login, finishes its step
+        // first; the next one waits for the migration.
+        await this.queueStep?.catch(() => {});
+        if (this.stopRequested) {
+          break;
+        }
+        const result = this.mergeChatKey(key, channelId, peer, { peerType: fromMessages.chats.get(channelId) });
+        report.moved.push(result);
+        const how = peer ? '' : ', found by its messages as Telegram did not find the username';
+        console.log(`[archive] Chat ${key} is now stored as ${channelId}${how}: ${result.messages} message(s) moved, ${result.duplicates} duplicate(s) dropped.`);
+      } catch (error) {
+        console.error(`[archive] Chat ${key}: moving it${channelId ? ` to ${channelId}` : ''} failed: ${error?.message ?? error}`);
+        try {
+          left('failed', `moving it${channelId ? ` to ${channelId}` : ''} failed: ${error?.message ?? error}`);
+        } catch {
+          // The archive refused the note too; the next start tries the chat again.
+        }
+      }
+    }
+    console.log(`[archive] Chats under a username: ${report.moved.length} moved to their ids, ${report.dropped.length} dropped as empty, ${report.left.length} left as they are.`);
+    return report;
+  }
+
+  // A chat under a username Telegram does not know, with no message under it, holds
+  // nothing worth keeping: its job can never run. Drops every row under the key.
+  dropChatKey(key) {
+    return this.db.transaction(() => {
+      const count = (table) => this.db.prepare(`SELECT COUNT(*) AS n FROM "${table}" WHERE channel_id = ?`).get(key).n;
+      const dropped = { key, jobs: count('jobs'), repairs: count('archive_repairs'), rows: 0 };
+      for (const table of this._chatKeyedTables()) {
+        dropped.rows += this.db.prepare(`DELETE FROM "${table}" WHERE channel_id = ?`).run(key).changes;
+      }
+      this.db.prepare('DELETE FROM username_key_checks WHERE chat_key = ?').run(key);
+      return dropped;
+    })();
+  }
+
+  // Moves everything under the username key to the chat's id in one transaction, so a
+  // stop halfway leaves the chat whole under one key or the other. Rows already under
+  // the id stay as they are: a message both have keeps the copy under the id, links
+  // and media included. Work still due under the username carries over.
+  mergeChatKey(key, channelId, peer = null, { peerType = null } = {}) {
+    const target = chatIdForWrite(channelId);
+    return this.db.transaction(() => {
+      const total = this.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE channel_id = ?').get(key).n;
+      const isNewChat = !this._getChannel(target);
+      for (const table of ['message_links', 'message_media']) {
+        this._copyChatRows(table, key, target, 'AND message_id NOT IN (SELECT message_id FROM messages WHERE channel_id = ?)', [target]);
+      }
+      const moved = this._copyChatRows('messages', key, target);
+      for (const table of this._chatKeyedTables()) {
+        if (!MERGED_APART.has(table)) {
+          this._copyChatRows(table, key, target);
+        }
+      }
+      // The row under the username has the type Telegram gave a username, which is wrong.
+      // Without Telegram's answer the messages' own peer gives the type.
+      if (isNewChat && peer) {
+        this._ensureChannelFromPeer(target, peer);
+      } else if (isNewChat && peerType) {
+        this.db.prepare('UPDATE channels SET peer_type = ? WHERE channel_id = ?').run(peerType, target);
+      }
+      // Sync turned off under the username was the user's doing, as the server turns off
+      // only chats under an id, so it stays off under the id too. The id's cursors stay:
+      // backfill from its oldest message walks over the moved ones.
+      this.db.prepare(`
+        UPDATE channels SET sync_enabled = 0, sync_by_user = 1, sync_off_reason = NULL
+        WHERE channel_id = ? AND EXISTS (SELECT 1 FROM channels WHERE channel_id = ? AND sync_enabled = 0)
+      `).run(target, key);
+      this._mergeChatJob(key, target);
+      this._mergeChatRepair(key, target);
+      for (const table of this._chatKeyedTables()) {
+        this.db.prepare(`DELETE FROM "${table}" WHERE channel_id = ?`).run(key);
+      }
+      this.db.prepare('DELETE FROM username_key_checks WHERE chat_key = ?').run(key);
+      return { key, channelId: target, messages: moved, duplicates: total - moved };
+    })();
+  }
+
+  // Tables that key rows by chat, read from the schema so one added later moves too.
+  _chatKeyedTables() {
+    this.chatKeyedTables ??= this.db.prepare(`
+      SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name
+    `).all().map((row) => row.name).filter((name) => this._copyableColumns(name).includes('channel_id'));
+    return this.chatKeyedTables;
+  }
+
+  // Columns a copy of a row takes along: all but a rowid alias, which gets a new value.
+  _copyableColumns(table) {
+    const columns = this.db.prepare(`PRAGMA table_info("${table}")`).all();
+    const keyColumns = columns.filter((column) => column.pk > 0);
+    const rowid = keyColumns.length === 1 && keyColumns[0].type.toUpperCase() === 'INTEGER' ? keyColumns[0].name : null;
+    return columns.map((column) => column.name).filter((name) => name !== rowid);
+  }
+
+  _copyChatRows(table, key, target, filter = '', params = []) {
+    const columns = this._copyableColumns(table).filter((name) => name !== 'channel_id').map((name) => `"${name}"`);
+    const list = ['channel_id', ...columns].join(', ');
+    const values = ['?', ...columns].join(', ');
+    return this.db.prepare(`
+      INSERT OR IGNORE INTO "${table}" (${list})
+      SELECT ${values} FROM "${table}" WHERE channel_id = ? ${filter}
+    `).run(target, key, ...params).changes;
+  }
+
+  // One job per chat. Without one under the id the username's job becomes it; with
+  // one, the fetching the username's job still had ahead of it falls to that job.
+  _mergeChatJob(key, target) {
+    const from = this.db.prepare('SELECT * FROM jobs WHERE channel_id = ?').get(key);
+    if (!from) {
+      return;
+    }
+    const into = this.db.prepare('SELECT * FROM jobs WHERE channel_id = ?').get(target);
+    if (!into) {
+      this.db.prepare('UPDATE jobs SET channel_id = ? WHERE id = ?').run(target, from.id);
+    } else if (UNFINISHED_STATUSES.has(from.status)) {
+      // A depth or date bound left out asks for more, not less.
+      this.db.prepare(`
+        UPDATE jobs SET
+          status = CASE WHEN status = '${JOB_STATUS.IN_PROGRESS}' THEN status ELSE '${JOB_STATUS.PENDING}' END,
+          error = NULL,
+          target_message_count = MAX(COALESCE(target_message_count, 0), COALESCE(?, 0)),
+          backfill_min_date = CASE WHEN backfill_min_date IS NULL OR ? IS NULL THEN NULL ELSE MIN(backfill_min_date, ?) END,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run(from.target_message_count, from.backfill_min_date, from.backfill_min_date, into.id);
+    }
+    // As addJob does: the request was the user's word on the chat.
+    if (UNFINISHED_STATUSES.has(from.status)) {
+      this.db.prepare(`
+        UPDATE channels SET
+          newer_sync_pending = 1,
+          sync_by_user = 1,
+          sync_enabled = CASE WHEN sync_off_reason = 'left' THEN 1 ELSE sync_enabled END,
+          sync_off_reason = NULL
+        WHERE channel_id = ?
+      `).run(target);
+    }
+  }
+
+  // One repair per chat. The username's one takes over only while it still has work
+  // and the id's has none; the new generation keeps a page in flight from writing to it.
+  _mergeChatRepair(key, target) {
+    const from = this.db.prepare('SELECT * FROM archive_repairs WHERE channel_id = ?').get(key);
+    if (!from) {
+      return;
+    }
+    const into = this.db.prepare('SELECT * FROM archive_repairs WHERE channel_id = ?').get(target);
+    if (into && (!UNFINISHED_STATUSES.has(from.status) || UNFINISHED_STATUSES.has(into.status))) {
+      return;
+    }
+    this.db.prepare('DELETE FROM archive_repairs WHERE channel_id = ?').run(target);
+    this.db.prepare('UPDATE archive_repairs SET channel_id = ?, generation = ? WHERE channel_id = ?')
+      .run(target, Math.max(from.generation, into?.generation ?? 0) + 1, key);
+  }
+
+  // The chats the messages under a key came from, by id with their peer type, and how
+  // many of the messages say at all.
+  _chatsOfMessages(key) {
+    const rows = this.db.prepare(`
+      SELECT type, id, COUNT(*) AS n FROM (
+        SELECT
+          CASE WHEN json_valid(raw_json) THEN json_extract(raw_json, '$.raw.peerId._') END AS type,
+          CASE WHEN json_valid(raw_json) THEN COALESCE(
+            json_extract(raw_json, '$.raw.peerId.userId'),
+            json_extract(raw_json, '$.raw.peerId.chatId'),
+            json_extract(raw_json, '$.raw.peerId.channelId')
+          ) END AS id
+        FROM messages
+        WHERE channel_id = ?
+      )
+      GROUP BY type, id
+    `).all(key);
+    const types = { peerUser: 'user', peerChat: 'chat', peerChannel: 'channel' };
+    const result = { total: 0, withPeer: 0, chats: new Map() };
+    for (const row of rows) {
+      result.total += row.n;
+      if (types[row.type] && Number.isFinite(Number(row.id))) {
+        result.withPeer += row.n;
+        result.chats.set(String(getMarkedPeerId(Number(row.id), types[row.type])), types[row.type]);
+      }
+    }
+    return result;
+  }
+
+  // Work under the username can only wait for the chat's id, and waiting would keep
+  // the server from exiting or making way for a newer version.
+  _parkUsernameKey(key, outcome, detail, now) {
+    this.db.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO username_key_checks (chat_key, outcome, detail, checked_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT(chat_key) DO UPDATE SET
+          outcome = excluded.outcome, detail = excluded.detail, checked_at = excluded.checked_at
+      `).run(key, outcome, detail, now);
+      for (const table of ['jobs', 'archive_repairs']) {
+        this.db.prepare(`
+          UPDATE ${table} SET status = ?, error = ?, updated_at = CURRENT_TIMESTAMP
+          WHERE channel_id = ? AND status IN (?, ?)
+        `).run(JOB_STATUS.ERROR, `Stored under the username ${key}: ${detail}.`, key, JOB_STATUS.PENDING, JOB_STATUS.IN_PROGRESS);
+      }
+    })();
+  }
+
   startRealtimeSync() {
     if (this.realtimeActive) {
       return;
@@ -2077,27 +2965,159 @@ export default class MessageSyncService {
     const deleteMessageHandler = (update) => {
       this._handleDeleteMessage(update);
     };
-
-    this.telegramClient.client.onNewMessage.add(newMessageHandler);
-    this.telegramClient.client.onEditMessage.add(editMessageHandler);
-    this.telegramClient.client.onDeleteMessage.add(deleteMessageHandler);
+    const connectionStateHandler = (state) => {
+      this._handleConnectionState(state);
+    };
 
     this.realtimeHandlers = {
       newMessageHandler,
       editMessageHandler,
       deleteMessageHandler,
+      connectionStateHandler,
     };
+    this.reconcileNeeded = true;
+    this._attachRealtimeHandlers();
+    this._startPeriodicChecks();
+    console.log('[sync] Realtime handlers attached.');
+
+    this.unsubscribeClientReplaced = this.telegramClient.onClientReplaced(() => {
+      this._attachRealtimeHandlers();
+      console.log('[sync] Realtime handlers moved to the new Telegram client.');
+    });
 
     this.unsubscribeChannelTooLong = this.telegramClient.onChannelTooLong((payload) => {
-      // The handler is async now (it awaits the catch-up). mtcute's emitter does
-      // not await us, so keep the rejection handled here — an insert throwing
-      // synchronously would otherwise surface as an unhandled rejection.
+      // The handler is async; mtcute's emitter does not await us, so keep the
+      // rejection handled here — an insert throwing would otherwise surface as
+      // an unhandled rejection.
       void this._handleChannelTooLong(payload).catch((error) => {
         console.warn('[warning] CHANNEL_TOO_LONG handler failed:', error?.message || error);
       });
     });
 
     this.realtimeActive = true;
+  }
+
+  _attachRealtimeHandlers() {
+    const { client } = this.telegramClient;
+    client.onNewMessage.add(this.realtimeHandlers.newMessageHandler);
+    client.onEditMessage.add(this.realtimeHandlers.editMessageHandler);
+    client.onDeleteMessage.add(this.realtimeHandlers.deleteMessageHandler);
+    client.onConnectionState.add(this.realtimeHandlers.connectionStateHandler);
+  }
+
+  _detachRealtimeHandlers() {
+    const { client } = this.telegramClient;
+    client.onNewMessage.remove(this.realtimeHandlers.newMessageHandler);
+    client.onEditMessage.remove(this.realtimeHandlers.editMessageHandler);
+    client.onDeleteMessage.remove(this.realtimeHandlers.deleteMessageHandler);
+    client.onConnectionState.remove(this.realtimeHandlers.connectionStateHandler);
+  }
+
+  _cursorsHeld() {
+    return this.reconcileNeeded || this.disconnectedAt !== null;
+  }
+
+  _handleConnectionState(state) {
+    this._checkForSleep();
+    if (state === 'offline' || state === 'connecting') {
+      this.disconnectedAt ??= Date.now();
+      this.disconnectCount += 1;
+      return;
+    }
+    void this._confirmConnection();
+  }
+
+  // 'connected' only says a socket opened, which a VPN or a captive portal also allows
+  // with Telegram out of reach. The outage lasts until Telegram answers. Whatever goes
+  // wrong here, the periodic check asks again.
+  async _confirmConnection() {
+    if (this.disconnectedAt === null || this.confirmingConnection || this.stopRequested) {
+      return;
+    }
+    // A comparison that has yet to start will cover this outage, and before it starts
+    // the client may not even be logged in.
+    if (this.reconcileNeeded && !this.reconcilePromise) {
+      this.disconnectedAt = null;
+      return;
+    }
+    this.confirmingConnection = true;
+    const disconnectCount = this.disconnectCount;
+    try {
+      await this.telegramClient.client.call({ _: 'updates.getState' }, { timeout: CONNECTION_CHECK_TIMEOUT_MS });
+      if (disconnectCount !== this.disconnectCount || this.stopRequested) {
+        return;
+      }
+      if (Date.now() - this.disconnectedAt >= LONG_OUTAGE_MS) {
+        this._reconcileAfterOutage();
+      }
+      this.disconnectedAt = null;
+    } catch {
+      // Still out of reach.
+    } finally {
+      this.confirmingConnection = false;
+    }
+  }
+
+  _startPeriodicChecks() {
+    this.lastCheckAt = Date.now();
+    this.periodicChecksStartedAt = this.lastCheckAt;
+    this.periodicCheckTimer = setInterval(() => {
+      this._checkForSleep();
+      void this._confirmConnection();
+      this._retryErroredJobsWhenDue();
+      this._reconcileWhenDue();
+      void this._recheckDueMessages();
+    }, PERIODIC_CHECK_INTERVAL_MS);
+    this.periodicCheckTimer.unref?.();
+  }
+
+  // A sleeping machine may report no disconnect at all, so a long pause between checks
+  // is the only sign of it. The timer can fire well after waking where timers do not
+  // count sleep, as on Linux, so connection changes and updates check as well, ahead of
+  // any cursor they could move.
+  _checkForSleep() {
+    const now = Date.now();
+    if (this.realtimeActive && now - this.lastCheckAt >= LONG_OUTAGE_MS) {
+      this._reconcileAfterOutage();
+    }
+    this.lastCheckAt = now;
+  }
+
+  _reconcileAfterOutage() {
+    console.log('[sync] Telegram was out of reach for a long time, comparing the archive with the dialog list.');
+    this.reconcileNeeded = true;
+    void this.reconcileWithDialogs().then((dialogCount) => {
+      if (dialogCount !== null) {
+        this.resumePendingJobs();
+      }
+    });
+  }
+
+  // A failed job keeps its chat's cursor held, on a server that may not restart for weeks.
+  _retryErroredJobsWhenDue() {
+    const now = Date.now();
+    if (now - this.lastErroredJobsRetryAt < RETRY_MAX_MS) {
+      return;
+    }
+    this.lastErroredJobsRetryAt = now;
+    this._resetErroredJobs();
+    void this.processQueue();
+  }
+
+  // Updates leave no trace of what they never delivered, such as the last messages of
+  // a chat gone quiet, and a server with watched chats may not restart for weeks.
+  _reconcileWhenDue() {
+    const now = Date.now();
+    if (this.reconcileNeeded || now - this.lastReconcileAt < PERIODIC_RECONCILE_MS) {
+      return;
+    }
+    this.lastReconcileAt = now;
+    console.log('[sync] Hourly comparison of the archive with the dialog list.');
+    void this.reconcileWithDialogs().then((dialogCount) => {
+      if (dialogCount !== null) {
+        void this.processQueue();
+      }
+    });
   }
 
   async processQueue() {
@@ -2110,24 +3130,81 @@ export default class MessageSyncService {
     this.processing = true;
     try {
       while (true) {
+        // The migration merges jobs and repairs into the ones under the id, which
+        // must not be under way meanwhile. It waits for the step in flight.
+        await this._waitForUsernameKeyMigration();
         if (this.stopRequested) {
           break;
         }
         const job = this._getNextJob();
-        if (!job) {
+        const gapChannelId = job ? null : this._getNextGapChannelId();
+        const repair = job || gapChannelId ? null : this._getNextRepair();
+        let step;
+        if (job) {
+          step = this._processJob(job);
+        } else if (gapChannelId) {
+          step = this._fillChannelGap(gapChannelId);
+        } else if (repair) {
+          step = this._repairNextPage(repair);
+        } else {
+          this._scheduleNextGapRetry();
           break;
         }
-        await this._processJob(job);
-        await delay(this.interJobDelayMs);
+        this.queueStep = step;
+        try {
+          await step;
+        } finally {
+          this.queueStep = null;
+        }
+        await delay(repair ? this.repairPageDelayMs : this.interJobDelayMs);
       }
     } finally {
       this.processing = false;
     }
   }
 
+  // Waits out a migration under way, but not a stop: a lookup stuck on a dead
+  // connection must not hold up shutdown.
+  async _waitForUsernameKeyMigration() {
+    while (this.usernameKeyMigration && !this.stopRequested) {
+      await Promise.race([this.usernameKeyMigration.catch(() => {}), delay(1000)]);
+    }
+  }
+
   resumePendingJobs() {
     this._resetErroredJobs();
+    this.gapRetries.clear();
     void this.processQueue();
+    void this.refetchQueuedSentMessages();
+  }
+
+  async _fillChannelGap(channelId) {
+    try {
+      await this._syncNewerMessages(channelId);
+      this.gapRetries.delete(channelId);
+    } catch (error) {
+      if (this.stopRequested) {
+        return;
+      }
+      const waitSeconds = parseRequiredWaitSeconds(error);
+      if (waitSeconds !== null) {
+        console.log(`[sync] Channel ${channelId}: rate limited, waiting ${waitSeconds}s before fetching the rest of the gap.`);
+        await this._delayUnlessStopped(waitSeconds * 1000);
+        return;
+      }
+      const attempts = (this.gapRetries.get(channelId)?.attempts ?? 0) + 1;
+      const retryMs = Math.min(RETRY_BASE_MS * 2 ** (attempts - 1), RETRY_MAX_MS);
+      this.gapRetries.set(channelId, { attempts, retryAt: Date.now() + retryMs });
+      this.stats?.count('gaps.failed');
+      console.error(`[sync] Channel ${channelId}: failed to fill gap (attempt ${attempts}), retrying in ${retryMs / 1000}s: ${error?.message ?? error}`);
+    }
+  }
+
+  async _delayUnlessStopped(ms) {
+    const until = Date.now() + ms;
+    while (!this.stopRequested && Date.now() < until) {
+      await delay(Math.min(1000, until - Date.now()));
+    }
   }
 
   // Worker-only teardown. Stops the queue loop, requeues *only* the job this
@@ -2158,11 +3235,17 @@ export default class MessageSyncService {
   // the `jobs` table — so a read-only command run against a live server's store
   // cannot corrupt the server's in-progress job (#42).
   close() {
+    // A queue loop waiting out its delay would otherwise wake up to a closed archive.
+    this.stopRequested = true;
+    clearInterval(this.periodicCheckTimer);
+    clearTimeout(this.gapRetryTimer);
     if (this.realtimeActive && this.realtimeHandlers) {
-      this.telegramClient.client.onNewMessage.remove(this.realtimeHandlers.newMessageHandler);
-      this.telegramClient.client.onEditMessage.remove(this.realtimeHandlers.editMessageHandler);
-      this.telegramClient.client.onDeleteMessage.remove(this.realtimeHandlers.deleteMessageHandler);
+      this._detachRealtimeHandlers();
       this.realtimeHandlers = null;
+      if (this.unsubscribeClientReplaced) {
+        this.unsubscribeClientReplaced();
+        this.unsubscribeClientReplaced = null;
+      }
       if (this.unsubscribeChannelTooLong) {
         this.unsubscribeChannelTooLong();
         this.unsubscribeChannelTooLong = null;
@@ -2175,21 +3258,271 @@ export default class MessageSyncService {
     }
   }
 
+  // Work under a username waits for migrateUsernameKeys to move it to the chat's id.
   _getNextJob() {
     return this.db.prepare(`
       SELECT * FROM jobs
-      WHERE status IN ('${JOB_STATUS.PENDING}', '${JOB_STATUS.IN_PROGRESS}')
+      WHERE status IN ('${JOB_STATUS.PENDING}', '${JOB_STATUS.IN_PROGRESS}') AND ${chatIdSql()}
       ORDER BY updated_at ASC
       LIMIT 1
     `).get();
   }
 
+  // A chat the user has turned off keeps its failed job until it is turned on again.
   _resetErroredJobs() {
+    for (const table of ['jobs', 'archive_repairs']) {
+      this.db.prepare(`
+        UPDATE ${table}
+        SET status = ?, error = NULL, updated_at = CURRENT_TIMESTAMP
+        WHERE status = ? AND ${chatIdSql()}
+          AND channel_id IN (SELECT channel_id FROM channels WHERE sync_enabled = 1)
+      `).run(JOB_STATUS.PENDING, JOB_STATUS.ERROR);
+    }
+  }
+
+  // Queues a repair for each chat, or for every chat with sync on. A repair already
+  // queued for a chat starts over with the new bounds.
+  addRepairs({ chats = [], all = false, afterId = 0, sinceDate = null, dryRun = false } = {}) {
+    // A chat the account has left gets no updates, so its holes are not losses: --all
+    // leaves it alone, and asking for it by name still works.
+    const channelIds = all
+      ? this.db.prepare(`
+        SELECT channel_id FROM channels
+        WHERE sync_enabled = 1 AND in_dialogs IS NOT 0 AND ${chatIdSql()}
+        ORDER BY channel_id
+      `).all().map((row) => row.channel_id)
+      : chats.map((chat) => this._findRepairableChannelId(chat));
+    if (!channelIds.length) {
+      throw new Error('No chat has sync enabled.');
+    }
+    if (dryRun) {
+      // A dry run takes the chat's row, so over a repair still under way it would drop
+      // what that repair has yet to write.
+      const open = this.db.prepare(`
+        SELECT COUNT(*) AS n FROM archive_repairs
+        WHERE status IN (?, ?) AND dry_run = 0 AND channel_id IN (SELECT value FROM json_each(?))
+      `).get(JOB_STATUS.PENDING, JOB_STATUS.IN_PROGRESS, JSON.stringify(channelIds)).n;
+      if (open) {
+        throw new Error(`A repair is under way in ${open} of these chat(s); a dry run would replace it. Wait for it to finish (\`tgcli backfill status\`).`);
+      }
+    }
+    const upsert = this.db.prepare(`
+      INSERT INTO archive_repairs (channel_id, status, after_message_id, since_date, dry_run)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(channel_id) DO UPDATE SET
+        status = excluded.status,
+        after_message_id = excluded.after_message_id,
+        since_date = excluded.since_date,
+        dry_run = excluded.dry_run,
+        cursor_message_id = NULL,
+        checked_count = 0,
+        added_count = 0,
+        error = NULL,
+        generation = archive_repairs.generation + 1,
+        created_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+    `);
+    this.db.transaction(() => {
+      for (const channelId of channelIds) {
+        upsert.run(channelId, JOB_STATUS.PENDING, Math.max(0, Number(afterId) || 0), sinceDate ?? null, dryRun ? 1 : 0);
+      }
+      if (all && !dryRun) {
+        this._setRepairNotNeeded('every synced chat repaired');
+      }
+    })();
+    return channelIds;
+  }
+
+  // Synced chats missing from the dialog list that Telegram gave no answer about: most
+  // often a private chat the account was removed from, which Telegram refuses the same way
+  // it refuses a stale access hash, so the server leaves them for the user to turn off.
+  listUnansweredChats() {
+    return this.db.prepare(`
+      SELECT channel_id, peer_title, membership_checked_at FROM channels
+      WHERE sync_enabled = 1 AND in_dialogs = 0 AND membership = 'unknown' AND COALESCE(sync_by_user, 0) = 0
+      ORDER BY channel_id
+    `).all();
+  }
+
+  unwatchUnansweredChats() {
+    return this.db.prepare(`
+      UPDATE channels
+      SET sync_enabled = 0, sync_by_user = 0, sync_off_reason = NULL, membership = NULL,
+        membership_checked_at = NULL, updated_at = CURRENT_TIMESTAMP
+      WHERE sync_enabled = 1 AND in_dialogs = 0 AND membership = 'unknown' AND COALESCE(sync_by_user, 0) = 0
+      RETURNING channel_id
+    `).all().map((row) => row.channel_id).sort();
+  }
+
+  // What the server did about synced chats missing from the dialog list.
+  getLeftChatCounts() {
+    return this.db.prepare(`
+      SELECT
+        COALESCE(SUM(sync_off_reason = 'left' AND sync_enabled = 0), 0) AS syncOff,
+        COALESCE(SUM(sync_enabled = 1 AND in_dialogs = 0 AND membership = 'member'), 0) AS stillJoined
+      FROM channels
+    `).get();
+  }
+
+  // Archives written before 2.2.5 can hold holes nothing fills by itself. Finding them
+  // costs as much as filling them, so this only says whether `--all` has run, or the
+  // archive was started by a version with the fixes.
+  isRepairSuggested() {
+    if (this.db.prepare("SELECT 1 FROM search_meta WHERE key = 'archive_repair'").get()) {
+      return false;
+    }
+    return Boolean(this.db.prepare(`
+      SELECT 1 FROM channels
+      WHERE sync_enabled = 1
+        AND EXISTS (SELECT 1 FROM messages WHERE messages.channel_id = channels.channel_id)
+      LIMIT 1
+    `).get());
+  }
+
+  _setRepairNotNeeded(reason) {
     this.db.prepare(`
-      UPDATE jobs
-      SET status = ?, error = NULL, updated_at = CURRENT_TIMESTAMP
-      WHERE status = ?
-    `).run(JOB_STATUS.PENDING, JOB_STATUS.ERROR);
+      INSERT INTO search_meta (key, value) VALUES ('archive_repair', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(reason);
+  }
+
+  _findRepairableChannelId(chat) {
+    const key = String(chat ?? '').trim();
+    const channel = this.db.prepare(`
+      SELECT channel_id, sync_enabled FROM channels
+      WHERE (channel_id = ? OR (username IS NOT NULL AND LOWER(username) = LOWER(?))) AND ${chatIdSql()}
+    `).get(normalizeChannelKey(key), key.replace(/^@/, ''));
+    if (!channel && this._getChannel(normalizeChannelKey(key))) {
+      throw new Error(`Chat ${key} is still stored under its username, not its Telegram id; \`tgcli doctor\` says why.`);
+    }
+    if (!channel) {
+      throw new Error(`Chat ${key} is not in the archive.`);
+    }
+    if (channel.sync_enabled !== 1) {
+      throw new Error(`Chat ${key} has sync disabled; enable it first if it belongs in the archive.`);
+    }
+    return channel.channel_id;
+  }
+
+  listRepairs({ channelIds = null } = {}) {
+    const filter = channelIds?.length
+      ? `WHERE archive_repairs.channel_id IN (${channelIds.map(() => '?').join(', ')})`
+      : '';
+    return this.db.prepare(`
+      SELECT archive_repairs.*, channels.peer_title
+      FROM archive_repairs
+      LEFT JOIN channels ON channels.channel_id = archive_repairs.channel_id
+      ${filter}
+      ORDER BY archive_repairs.created_at, archive_repairs.channel_id
+    `).all(...(channelIds ?? []));
+  }
+
+  // The one already under way first, so chats finish one after another.
+  _getNextRepair() {
+    return this.db.prepare(`
+      SELECT * FROM archive_repairs
+      WHERE status IN (?, ?) AND ${chatIdSql()}
+      ORDER BY status = ? DESC, created_at, channel_id
+      LIMIT 1
+    `).get(JOB_STATUS.PENDING, JOB_STATUS.IN_PROGRESS, JOB_STATUS.IN_PROGRESS);
+  }
+
+  // Reads one page of history below the repair's cursor and writes back what the archive
+  // lacks, down to the repair's bounds.
+  async _repairNextPage(repair) {
+    const channelId = repair.channel_id;
+    // Asking again for the chat bumps the generation, and this page's writes go nowhere.
+    const update = (assignments, ...params) => this.db.prepare(`
+      UPDATE archive_repairs SET ${assignments}, updated_at = CURRENT_TIMESTAMP
+      WHERE channel_id = ? AND generation = ?
+    `).run(...params, channelId, repair.generation);
+    const fail = (message) => update('status = ?, error = ?', JOB_STATUS.ERROR, message);
+
+    if (this._getChannel(channelId)?.sync_enabled !== 1) {
+      fail('Sync is disabled for this chat.');
+      this.stats?.count('repair.failed');
+      return;
+    }
+    const { floor, sinceDate } = this._repairBounds(channelId, repair);
+    update('status = ?', JOB_STATUS.IN_PROGRESS);
+
+    try {
+      const { messages } = await this.telegramClient.getMessagesByChannelId(channelId, REPAIR_PAGE_SIZE, {
+        offsetId: repair.cursor_message_id ?? 0,
+      });
+      const inRange = messages.filter((message) => message.id > floor
+        && !(sinceDate && message.date && message.date < sinceDate));
+      let added = 0;
+      if (inRange.length) {
+        added = repair.dry_run ? this._countMissingMessages(channelId, inRange) : this.archiveHistoryMessages(channelId, inRange);
+      }
+      const done = !messages.length || inRange.length < messages.length;
+      const cursor = messages.length
+        ? Math.min(...messages.map((message) => message.id))
+        : repair.cursor_message_id;
+      update(
+        'status = ?, cursor_message_id = ?, checked_count = checked_count + ?, added_count = added_count + ?, error = NULL',
+        done ? JOB_STATUS.IDLE : JOB_STATUS.IN_PROGRESS,
+        cursor ?? null,
+        inRange.length,
+        added,
+      );
+      const verb = repair.dry_run ? 'would add' : 'added';
+      this.stats?.count('repair.pages');
+      this.stats?.count('repair.checked', inRange.length);
+      this.stats?.count(repair.dry_run ? 'repair.wouldAdd' : 'repair.added', added);
+      if (done) {
+        this.stats?.count('repair.completed');
+      }
+      if (added) {
+        console.log(`[sync] Channel ${channelId}: repair ${verb} ${added} message(s) at ${cursor}.`);
+      }
+      if (done) {
+        const row = this.db.prepare('SELECT checked_count, added_count FROM archive_repairs WHERE channel_id = ?').get(channelId);
+        console.log(`[sync] Channel ${channelId}: repair done, checked ${row?.checked_count}, ${verb} ${row?.added_count}.`);
+      }
+    } catch (error) {
+      if (this.stopRequested) {
+        return;
+      }
+      const waitSeconds = parseRequiredWaitSeconds(error);
+      if (waitSeconds !== null) {
+        update('error = ?', `Rate limited, waiting ${waitSeconds}s`);
+        console.log(`[sync] Channel ${channelId}: rate limited, waiting ${waitSeconds}s before the next page of the repair.`);
+        await this._delayUnlessStopped(waitSeconds * 1000);
+        return;
+      }
+      if (isChatGone(error)) {
+        // Not a member any more, or the chat is gone: asking again every hour changes nothing.
+        update('status = ?, error = ?', REPAIR_STATUS.SKIPPED, error?.message ?? String(error));
+        this.stats?.count('repair.skipped');
+        console.log(`[sync] Channel ${channelId}: repair skipped, Telegram refuses to read it: ${error?.message ?? error}`);
+        return;
+      }
+      fail(error?.message ?? String(error));
+      this.stats?.count('repair.failed');
+      console.error(`[sync] Channel ${channelId}: repair failed below message ${repair.cursor_message_id ?? 'newest'}: ${error?.message ?? error}`);
+    }
+  }
+
+  _countMissingMessages(channelId, messages) {
+    const ids = messages.map((message) => message.id);
+    const { present } = this.db.prepare(`
+      SELECT COUNT(*) AS present FROM messages
+      WHERE channel_id = ? AND message_id IN (SELECT value FROM json_each(?))
+    `).get(channelId, JSON.stringify(ids));
+    return ids.length - present;
+  }
+
+  // Holes lie where the archive followed the chat: from when the chat entered the archive,
+  // and within the asked bounds. History below that came from a backfill, which pages
+  // through it without gaps, or never came, which is what backfill --depth is for.
+  _repairBounds(channelId, repair) {
+    const row = this.db.prepare(`
+      SELECT CAST(strftime('%s', created_at) AS INTEGER) AS entered_at FROM channels WHERE channel_id = ?
+    `).get(channelId);
+    const sinceDate = Math.max(repair.since_date ?? 0, row?.entered_at ?? 0) || null;
+    return { floor: repair.after_message_id ?? 0, sinceDate };
   }
 
   searchMessages({ channelId, topicId, pattern, limit = 50, caseInsensitive = true }) {
@@ -2820,6 +4153,7 @@ export default class MessageSyncService {
     }
 
     this._updateJobStatus(job.id, JOB_STATUS.IN_PROGRESS);
+    this.stats?.count('jobs.runs');
     // Claim ownership so shutdown() requeues this job (and only this one) if the
     // process exits before _processJob writes its terminal/pending status.
     this.ownedInProgressJobId = job.id;
@@ -2854,22 +4188,25 @@ export default class MessageSyncService {
         cursorMessageId: backfillResult.cursorMessageId,
         cursorMessageDate: backfillResult.cursorMessageDate,
       });
+      if (finalStatus === JOB_STATUS.IDLE) {
+        this.stats?.count('jobs.completed');
+      }
     } catch (error) {
       if (this.stopRequested) {
         this._updateJobStatus(job.id, JOB_STATUS.PENDING);
         return;
       }
-      const waitMatch = /wait of (\d+) seconds is required/i.exec(error.message || '');
-      if (waitMatch) {
-        const waitSeconds = Number(waitMatch[1]);
+      const waitSeconds = parseRequiredWaitSeconds(error);
+      if (waitSeconds !== null) {
         this.db.prepare(`
           UPDATE jobs
           SET status = ?, error = ?, updated_at = CURRENT_TIMESTAMP
           WHERE id = ?
         `).run(JOB_STATUS.PENDING, `Rate limited, waiting ${waitSeconds}s`, job.id);
-        await delay(waitSeconds * 1000);
+        await this._delayUnlessStopped(waitSeconds * 1000);
       } else {
         this._markJobError(job.id, error);
+        this.stats?.count('jobs.failed');
       }
     } finally {
       // _processJob always writes a non-in_progress status above before
@@ -3109,7 +4446,7 @@ export default class MessageSyncService {
     const searchFields = buildSearchFields(message);
     const mediaSummary = extractMediaSummary(message);
     return {
-      channel_id: channelId,
+      channel_id: chatIdForWrite(channelId),
       message_id: message.id,
       topic_id: message.topic_id ?? null,
       date: message.date ?? null,
@@ -3186,7 +4523,9 @@ export default class MessageSyncService {
   _getChannel(channelId) {
     return this.db.prepare(`
       SELECT channel_id, peer_title, peer_type, username, sync_enabled,
-             last_message_id, last_message_date, oldest_message_id, oldest_message_date
+             last_message_id, last_message_date, oldest_message_id, oldest_message_date,
+             gap_after_message_id,
+             newer_sync_pending
       FROM channels
       WHERE channel_id = ?
     `).get(channelId);
@@ -3257,6 +4596,18 @@ export default class MessageSyncService {
     );
   }
 
+  // last_message_id is where a pending newer sync resumes, so until it reaches the newest
+  // message updates leave it alone: their message may be far above what is fetched so far.
+  // The sync sees that message again on its way up, and the archive ignores the repeat.
+  // The same goes for a cursor waiting to be compared with the dialog list. A chat with no
+  // cursor has nothing to compare, and no reason to wait for its first one.
+  _updateChannelCursorsFromUpdate(channelId, { lastMessageId, lastMessageDate, ...oldest }) {
+    const channel = this._getChannel(channelId);
+    const held = channel?.newer_sync_pending || (this._cursorsHeld() && channel?.last_message_id > 0);
+    const newest = held ? {} : { lastMessageId, lastMessageDate };
+    this._updateChannelCursors(channelId, { ...newest, ...oldest });
+  }
+
   _ensureChannelFromPeer(channelId, peer) {
     const peerTitle = peer?.displayName ?? null;
     const peerType = normalizePeerType(peer);
@@ -3315,15 +4666,73 @@ export default class MessageSyncService {
   }
 
   _handleIncomingMessage(message, { isEdit }) {
-    if (!message?.chat?.id) {
+    this._checkForSleep();
+    const record = this._writeMessage(message, { isEdit });
+    if (!record) {
       return;
+    }
+    // An edit can touch a message of any age, so it says nothing about what is
+    // archived around it. Moving a cursor here would hide history from later syncs.
+    if (isEdit) {
+      this._publishSubscriptionEvent(record.channel_id, record.message_id, true);
+      return;
+    }
+
+    const idsJumped = this._markGapIfIdsJumped(record.channel_id, message);
+    const messageDate = toIsoString(record.date);
+    this._updateChannelCursorsFromUpdate(record.channel_id, {
+      lastMessageId: record.message_id,
+      lastMessageDate: messageDate,
+      oldestMessageId: record.message_id,
+      oldestMessageDate: messageDate,
+    });
+    // After the write and the cursor update, so a subscriber never observes a
+    // half-written message.
+    this._publishSubscriptionEvent(record.channel_id, record.message_id, false);
+    if (idsJumped) {
+      void this.processQueue();
+    }
+  }
+
+  // In a channel or supergroup ids run in sequence, so one that jumps over the cursor
+  // means updates were lost, whatever the reason, or messages were deleted, which costs
+  // one history page. Private chats and basic groups share ids across the account, but
+  // they have no channel difference to fail. A held cursor stays below the message, so
+  // whatever holds it will find the same messages.
+  _markGapIfIdsJumped(channelId, message) {
+    if (message.raw?.peerId?._ !== 'peerChannel') {
+      return false;
+    }
+    const channel = this._getChannel(channelId);
+    if (
+      !(channel?.last_message_id > 0)
+      || message.id <= channel.last_message_id + 1
+      || channel.gap_after_message_id !== null
+      || channel.newer_sync_pending
+      || this._cursorsHeld()
+    ) {
+      return false;
+    }
+    console.log(`[sync] Channel ${channelId}: message ${message.id} came after ${channel.last_message_id}, fetching what lies between.`);
+    return this._markChannelGap(channelId);
+  }
+
+  // Returns the written record, or null if the message does not belong in the archive.
+  _writeMessage(message, { isEdit }) {
+    if (!message?.chat?.id) {
+      return null;
+    }
+    // A scheduled message is not in the chat's history yet: its id comes from a
+    // separate sequence, and it arrives again as a normal message once delivered.
+    if (message.isScheduled) {
+      return null;
     }
 
     const channelId = String(message.chat.id);
     const channelRow = this._ensureChannelFromPeer(channelId, message.chat);
     const syncEnabled = channelRow ? channelRow.sync_enabled === 1 : this._isChannelActive(channelId);
     if (!syncEnabled) {
-      return;
+      return null;
     }
 
     const senderRecord = this._buildUserRecordFromPeer(message.sender || message.from || message.author);
@@ -3334,27 +4743,87 @@ export default class MessageSyncService {
     const serialized = this.telegramClient._serializeMessage(message, message.chat);
     const record = this._buildMessageRecord(channelId, serialized);
 
-    if (isEdit) {
+    this._storeRecord(record, { replace: isEdit });
+    return record;
+  }
+
+  _storeRecord(record, { replace }) {
+    if (replace) {
       this.upsertMessageStmt.run(record);
-      this._replaceMessageLinks(record);
-      this._replaceMessageMedia(record);
     } else {
       this.insertMessageStmt.run(record);
-      this._replaceMessageLinks(record);
-      this._replaceMessageMedia(record);
     }
+    this._replaceMessageLinks(record);
+    this._replaceMessageMedia(record);
+  }
 
-    const messageDate = toIsoString(serialized.date);
-    this._updateChannelCursors(channelId, {
-      lastMessageId: serialized.id,
-      lastMessageDate: messageDate,
-      oldestMessageId: serialized.id,
-      oldestMessageDate: messageDate,
-    });
+  // mtcute keeps a client's own sends out of onNewMessage, so the send operations
+  // archive them here. The cursors stay put: a send says nothing about messages
+  // that arrived while the server was down, and moving last_message_id past them
+  // would hide them from _syncNewerMessages. Errors are the caller's to contain,
+  // as the message has already gone through.
+  archiveSentMessage(message) {
+    const record = this._writeMessage(message, { isEdit: false });
+    if (!record) {
+      console.log(`[archive] Skipped sent message ${message?.id} in chat ${message?.chat?.id}: scheduled, or the chat is not synced.`);
+      return;
+    }
+    console.log(`[archive] Archived sent message ${record.message_id} in chat ${record.channel_id}.`);
+    if (mayLackFullContent(message)) {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO sent_messages_to_refetch (channel_id, message_id) VALUES (?, ?)
+      `).run(record.channel_id, record.message_id);
+      void this._refetchSentMessage(record.channel_id, record.message_id);
+    }
+  }
 
-    // Last, deliberately: after the insert, the link/media replacement and the
-    // cursor update, so a subscriber never observes a half-written message.
-    this._publishSubscriptionEvent(channelId, serialized.id, isEdit);
+  // Replaces a queued row with Telegram's full copy. This has to be an explicit
+  // request: history goes through INSERT OR IGNORE and would never replace the row,
+  // and sync stops reaching it once the next message moves the cursor. Runs apart
+  // from the send, whose result must not wait on it or depend on it. A row that
+  // fails stays queued for the next server start.
+  async _refetchSentMessage(channelId, messageId) {
+    try {
+      const message = await this.telegramClient.getMessageById(channelId, messageId);
+      if (message) {
+        this._storeRecord(this._buildMessageRecord(channelId, message), { replace: true });
+        console.log(`[archive] Completed sent message ${messageId} in chat ${channelId}.`);
+      } else {
+        console.log(`[archive] Sent message ${messageId} in chat ${channelId} is gone from Telegram, its row stays as it is.`);
+      }
+      this.db.prepare(`
+        DELETE FROM sent_messages_to_refetch WHERE channel_id = ? AND message_id = ?
+      `).run(channelId, messageId);
+    } catch (error) {
+      if (this.stopRequested) {
+        return;
+      }
+      console.error(`[archive] Could not refetch sent message ${messageId} in chat ${channelId}, will retry on the next server start: ${error?.message ?? error}`);
+    }
+  }
+
+  async refetchQueuedSentMessages() {
+    try {
+      const queued = this.db.prepare('SELECT channel_id, message_id FROM sent_messages_to_refetch').all();
+      for (const { channel_id: channelId, message_id: messageId } of queued) {
+        if (this.stopRequested) {
+          return;
+        }
+        await this._refetchSentMessage(channelId, messageId);
+      }
+    } catch (error) {
+      console.error(`[archive] Could not read the queue of sent messages to refetch: ${error?.message ?? error}`);
+    }
+  }
+
+  // Writes messages fetched from history without touching the cursors, and returns
+  // how many were not in the archive yet.
+  archiveHistoryMessages(channelId, messages) {
+    const userRecords = messages.map((message) => this._buildUserRecordFromSerialized(message)).filter(Boolean);
+    if (userRecords.length) {
+      this.upsertUsersTx(userRecords);
+    }
+    return this.insertMessagesTx(messages.map((message) => this._buildMessageRecord(channelId, message)));
   }
 
   _handleDeleteMessage(update) {
@@ -3379,6 +4848,16 @@ export default class MessageSyncService {
         DELETE FROM message_media
         WHERE channel_id = ? AND message_id IN (${placeholders})
       `).run(channelId, ...ids);
+      // Telegram pushes a delete with a real ptsCount, and no message named that way has stayed.
+      // Only differences, always with ptsCount 0, have named messages that turned out real.
+      if (update.raw?.ptsCount > 0) {
+        this.db.prepare(`
+          DELETE FROM messages_to_recheck
+          WHERE channel_id = ? AND message_id IN (${placeholders})
+        `).run(channelId, ...ids);
+      } else {
+        this._queueRecheckOfDeleted(channelId, ids);
+      }
       return;
     }
 
@@ -3386,37 +4865,40 @@ export default class MessageSyncService {
       DELETE FROM messages
       WHERE message_id IN (${placeholders})
         AND channel_id IN (
-          SELECT channel_id FROM channels WHERE peer_type IN ('chat', 'user')
+          SELECT channel_id FROM channels
+          WHERE peer_type IN ('chat', 'user') AND CAST(channel_id AS INTEGER) > ${MAX_MARKED_CHANNEL_ID}
         )
     `).run(...ids);
     this.db.prepare(`
       DELETE FROM message_links
       WHERE message_id IN (${placeholders})
         AND channel_id IN (
-          SELECT channel_id FROM channels WHERE peer_type IN ('chat', 'user')
+          SELECT channel_id FROM channels
+          WHERE peer_type IN ('chat', 'user') AND CAST(channel_id AS INTEGER) > ${MAX_MARKED_CHANNEL_ID}
         )
     `).run(...ids);
     this.db.prepare(`
       DELETE FROM message_media
       WHERE message_id IN (${placeholders})
         AND channel_id IN (
-          SELECT channel_id FROM channels WHERE peer_type IN ('chat', 'user')
+          SELECT channel_id FROM channels
+          WHERE peer_type IN ('chat', 'user') AND CAST(channel_id AS INTEGER) > ${MAX_MARKED_CHANNEL_ID}
         )
     `).run(...ids);
   }
 
   /**
-   * Telegram could not express the gap as a diff — resync this channel.
+   * Telegram could not express what the archive missed as a diff.
    *
-   * CHANNEL_TOO_LONG means "you are too far behind, start over". The update
-   * carries a handful of recent messages at best and frequently none at all:
-   * mtcute asks for the difference with `channelMessagesFilterEmpty` and a pts
-   * limit, so an empty `messages` is the update's ORDINARY shape, not an edge
-   * case. That is also precisely when a catch-up matters most, so the catch-up
-   * runs whether or not the diff brought anything with it.
+   * The update carries a handful of the newest messages at best and frequently
+   * none at all: mtcute asks for the difference with `channelMessagesFilterEmpty`
+   * and a pts limit, so an empty `messages` is the update's ordinary shape. Either
+   * way the messages between the cursor and the newest one are missing, so a gap
+   * is recorded at the cursor (before any insert drags the cursor forward) and the
+   * queue fills it. The gap is on disk, so a failed or interrupted fill is retried,
+   * also after a restart. A chat with no cursor yet has nothing to fill.
    *
-   * Returns a promise so the catch-up can be awaited in tests and its failure
-   * logged; the realtime handler is sync and fires this without waiting.
+   * Async so the realtime handler can attach a catch for logging.
    */
   async _handleChannelTooLong({ channelId, diff }) {
     const channelKey = this._resolveTooLongChannelKey(channelId, diff);
@@ -3425,60 +4907,12 @@ export default class MessageSyncService {
       return;
     }
 
-    // Capture the cursor BEFORE inserting. The diff carries the channel's most
-    // RECENT messages, not the ones we are missing — archiving them first drags
-    // the cursor up to the newest of them, and the catch-up below, which pages
-    // forward from that cursor, then asks Telegram for messages after the gap
-    // instead of across it. Cursor at 100, realtime missed 101-497, diff brings
-    // 498-500: insert-then-sync loses 101-497 permanently.
-    const cursorBeforeDiff = this._getChannel(channelKey)?.last_message_id || 0;
-
-    try {
-      if (diff?.messages?.length) {
-        this._insertTooLongMessages(channelKey, diff);
-      }
-
-      // The heal itself. Pages forward from where the archive actually stopped
-      // until a page yields nothing new, so it closes the hole however far
-      // behind the archive fell. Never fire-and-forget: an unhandled rejection
-      // here leaves a permanent hole with nothing in the logs to explain it.
-      await this._syncNewerMessages(channelKey, { fromMessageId: cursorBeforeDiff });
-    } catch (error) {
-      console.warn(
-        `[warning] CHANNEL_TOO_LONG catch-up failed for ${channelKey}:`,
-        error?.message || error,
-      );
-      // A half-finished catch-up leaves the hole it was sent to close, and
-      // nothing would come back for it: TooLong fires when Telegram decides to,
-      // which may be never for a quiet channel. Hand it to the job queue, which
-      // already retries, is sequential (so a FLOOD_WAIT does not turn into a
-      // storm), and survives a restart via resumePendingJobs. addJob is
-      // idempotent per channel, so repeated failures coalesce into one job.
-      try {
-        // addJob is an upsert keyed on channel, so queueing here would rewrite a
-        // job that already exists — silently shrinking a user's deep backfill to
-        // our own depth, or resetting a row _processJob is about to overwrite
-        // with its terminal status, which would drop this retry entirely.
-        // Anything already pending or running will run the same catch-up.
-        const existing = this.listJobs({ channelId: channelKey })
-          .find((job) => job.status === JOB_STATUS.PENDING || job.status === JOB_STATUS.IN_PROGRESS);
-        if (existing) {
-          console.warn(`[warning] ${channelKey} already has a ${existing.status} job; leaving it to run the catch-up`);
-        } else {
-          // depth = what is already archived, so _backfillHistory sees
-          // currentCount >= targetCount and returns immediately. The job then
-          // does exactly what failed — sync forward — instead of also dragging
-          // in old history up to the 1000-message default. Floor of 1 because
-          // addJob treats a falsy depth as "use the default".
-          this.addJob(channelKey, { depth: Math.max(1, this._countMessages(channelKey)) });
-          void this.processQueue();
-        }
-      } catch (queueError) {
-        console.warn(
-          `[warning] could not queue a retry for ${channelKey}:`,
-          queueError?.message || queueError,
-        );
-      }
+    const hasGap = diff?.messages?.length
+      ? this._insertTooLongMessages(channelKey, diff)
+      : this._markChannelGap(channelKey);
+    if (hasGap) {
+      console.log(`[sync] Channel ${channelKey}: update diff too long, queued a history fetch for what it skipped.`);
+      void this.processQueue();
     }
   }
 
@@ -3513,7 +4947,7 @@ export default class MessageSyncService {
     return String(numericId > 0 ? toggleChannelIdMark(numericId) : numericId);
   }
 
-  /** Archive the recent messages a non-empty TooLong diff happened to carry. */
+  /** Archive the recent messages a non-empty TooLong diff carried; returns whether a gap was recorded. */
   _insertTooLongMessages(fallbackChannelKey, diff) {
     const peers = PeersIndex.from(diff);
     const records = [];
@@ -3529,10 +4963,19 @@ export default class MessageSyncService {
         continue;
       }
       const message = new Message(rawMessage, peers);
-      const channelKey = String(message.chat?.id ?? fallbackChannelKey);
+      let chat;
+      try {
+        chat = message.chat;
+      } catch (error) {
+        // A raw message with no peerId, or a peer missing from the diff's index,
+        // makes mtcute throw. Skip it; the gap below still covers it.
+        console.warn(`[warning] CHANNEL_TOO_LONG: skipped message ${rawMessage.id} in ${fallbackChannelKey}: ${error?.message ?? error}`);
+        continue;
+      }
+      const channelKey = String(chat?.id ?? fallbackChannelKey);
       batchChannelId = batchChannelId ?? channelKey;
 
-      const channelRow = this._ensureChannelFromPeer(channelKey, message.chat);
+      const channelRow = this._ensureChannelFromPeer(channelKey, chat);
       const syncEnabled = channelRow ? channelRow.sync_enabled === 1 : this._isChannelActive(channelKey);
       if (!syncEnabled) {
         continue;
@@ -3560,7 +5003,8 @@ export default class MessageSyncService {
     }
 
     if (!records.length || !batchChannelId) {
-      return;
+      // Nothing archivable came with the diff; the gap is still there.
+      return this._markChannelGap(fallbackChannelKey);
     }
 
     if (userRecords.size) {
@@ -3569,12 +5013,184 @@ export default class MessageSyncService {
 
     this.insertMessagesTx(records);
 
-    this._updateChannelCursors(batchChannelId, {
+    // The diff holds only the newest messages. mtcute has already moved past the rest
+    // and will not report them again, so the gap has to be on disk before anything else.
+    const hasGap = this._markChannelGap(batchChannelId);
+
+    this._updateChannelCursorsFromUpdate(batchChannelId, {
       lastMessageId: latestMessageId,
       lastMessageDate: latestMessageDate,
       oldestMessageId: oldestMessageId,
       oldestMessageDate: oldestMessageDate,
     });
+
+    return hasGap;
+  }
+
+  // In a burst of updates mtcute asks for a channel difference. Telegram can name fresh,
+  // real messages as deleted in it and hide them from history for a while, and mtcute
+  // then drops the copies it already received. Nothing announces them when they show up,
+  // so whatever a difference calls deleted, or a page of history skips, is read again later.
+  _queueRecheck(channelId, messageIds) {
+    if (this._getChannel(channelId)?.sync_enabled !== 1) {
+      return;
+    }
+    if (!messageIds.length) {
+      return;
+    }
+    // Named again, a message gets the full schedule again.
+    const queue = this.db.prepare(`
+      INSERT INTO messages_to_recheck (channel_id, message_id, queued_at) VALUES (?, ?, ?)
+      ON CONFLICT (channel_id, message_id) DO UPDATE SET queued_at = excluded.queued_at, attempts = 0
+    `);
+    const now = Date.now();
+    for (const messageId of messageIds) {
+      queue.run(channelId, messageId, now);
+    }
+    this.stats?.count('rechecks.queued', messageIds.length);
+    console.log(`[sync] Channel ${channelId}: will read ${messageIds.join(', ')} again, in case Telegram is hiding them.`);
+  }
+
+  // One already queued goes back too, however far the cursor has moved: a read of it may
+  // be on its way, with an answer older than this delete.
+  _queueRecheckOfDeleted(channelId, messageIds) {
+    const cursor = this._getChannel(channelId)?.last_message_id;
+    const queued = this.db.prepare(`
+      SELECT 1 FROM messages_to_recheck WHERE channel_id = ? AND message_id = ?
+    `);
+    this._queueRecheck(channelId, messageIds.filter((id) => (
+      (cursor > 0 && id > cursor - RECHECK_MAX_ID_DISTANCE) || queued.get(channelId, id)
+    )));
+  }
+
+  // Without a cursor the ids below a chat's first page are not missing.
+  _queueRecheckOfSkipped(channelId, cursor, messages) {
+    if (!hasSequentialIds(channelId)) {
+      return;
+    }
+    const recentSince = Date.now() - RECHECK_RECENT_MS;
+    const skipped = [];
+    let previous = cursor > 0 ? cursor : messages[0].id;
+    for (const message of messages) {
+      if (message.date * 1000 >= recentSince && message.id - previous <= RECHECK_MAX_ID_DISTANCE) {
+        for (let id = previous + 1; id < message.id; id += 1) {
+          skipped.push(id);
+        }
+      }
+      previous = message.id;
+    }
+    this._queueRecheck(channelId, skipped);
+  }
+
+  // A fill can end below the cursor when history hides the newest messages as well.
+  _queueRecheckUpToCursor(channelId, fromId) {
+    const cursor = this._getChannel(channelId)?.last_message_id;
+    if (!hasSequentialIds(channelId) || !(cursor - fromId <= RECHECK_MAX_ID_DISTANCE)) {
+      return;
+    }
+    const archived = new Set(this.db.prepare(`
+      SELECT message_id FROM messages WHERE channel_id = ? AND message_id > ? AND message_id < ?
+    `).all(channelId, fromId, cursor).map((row) => row.message_id));
+    const missing = [];
+    for (let id = fromId + 1; id < cursor; id += 1) {
+      if (!archived.has(id)) {
+        missing.push(id);
+      }
+    }
+    this._queueRecheck(channelId, missing);
+  }
+
+  async _recheckDueMessages() {
+    // An outage would use up the attempts with nothing learned.
+    if (this.recheckingMessages || this.disconnectedAt !== null) {
+      return;
+    }
+    this.recheckingMessages = true;
+    try {
+      const now = Date.now();
+      const due = this.db.prepare(`
+        SELECT channel_id, message_id, queued_at, attempts FROM messages_to_recheck
+      `).all().filter((row) => now - row.queued_at >= (RECHECK_AFTER_MS[row.attempts] ?? 0));
+      for (const row of due) {
+        if (!await this._recheckMessage(row)) {
+          return;
+        }
+      }
+    } catch (error) {
+      if (!this.stopRequested) {
+        console.error(`[sync] Could not read the queue of messages to check again: ${error?.message ?? error}`);
+      }
+    } finally {
+      this.recheckingMessages = false;
+    }
+  }
+
+  // Returns false when the pass should stop for now.
+  async _recheckMessage({ channel_id: channelId, message_id: messageId, queued_at: queuedAt }) {
+    const forget = () => this.db.prepare(`
+      DELETE FROM messages_to_recheck WHERE channel_id = ? AND message_id = ?
+    `).run(channelId, messageId);
+
+    if (this._getChannel(channelId)?.sync_enabled !== 1) {
+      forget();
+      return true;
+    }
+
+    try {
+      const message = await this.telegramClient.getMessageById(channelId, messageId);
+      if (this.stopRequested) {
+        return false;
+      }
+      this.stats?.count('rechecks.checked');
+      const row = this.db.prepare(`
+        SELECT queued_at FROM messages_to_recheck WHERE channel_id = ? AND message_id = ?
+      `).get(channelId, messageId);
+      // Named deleted during the read: this answer may be older than the delete.
+      if (row?.queued_at !== queuedAt) {
+        return true;
+      }
+      if (message) {
+        this.stats?.count('rechecks.found');
+        if (this.archiveHistoryMessages(channelId, [message])) {
+          this.stats?.count('rechecks.restored');
+          console.log(`[sync] Channel ${channelId}: message ${messageId} turned out not to be deleted, archived.`);
+        }
+        forget();
+        return true;
+      }
+    } catch (error) {
+      if (this.stopRequested) {
+        return false;
+      }
+      this.stats?.count('rechecks.failed');
+      if (parseRequiredWaitSeconds(error) !== null) {
+        console.error(`[sync] Channel ${channelId}: rate limited checking message ${messageId}, will try again.`);
+        return false;
+      }
+      if (!isRefusedRead(error)) {
+        console.error(`[sync] Channel ${channelId}: could not check message ${messageId}: ${error?.message ?? error}`);
+        if (Date.now() - Math.max(queuedAt, this.periodicChecksStartedAt) >= RECHECK_GIVE_UP_MS) {
+          console.error(`[sync] Channel ${channelId}: no longer checking message ${messageId}.`);
+          this.stats?.count('rechecks.gaveUp');
+          forget();
+        }
+        return true;
+      }
+      console.error(`[sync] Channel ${channelId}: Telegram refused to show message ${messageId}: ${error.message}`);
+    }
+
+    // Downtime can leave several checks overdue, and one read answers for all of them.
+    const nextAttempt = RECHECK_AFTER_MS.findIndex((afterMs) => Date.now() - queuedAt < afterMs);
+    if (nextAttempt === -1) {
+      console.log(`[sync] Channel ${channelId}: message ${messageId} still not there, no longer checking.`);
+      this.stats?.count('rechecks.gaveUp');
+      forget();
+    } else {
+      this.db.prepare(`
+        UPDATE messages_to_recheck SET attempts = ? WHERE channel_id = ? AND message_id = ?
+      `).run(nextAttempt, channelId, messageId);
+    }
+    return true;
   }
 
   /**
@@ -3710,17 +5326,16 @@ export default class MessageSyncService {
       return { hasMoreNewer: false, stoppedEarly: false };
     }
 
-    // Callers that know the archive stopped earlier than the cursor suggests —
-    // a TooLong diff having just dragged it forward, or a subscriber replaying
-    // from further back — page from their own floor instead. Inserts are
-    // idempotent, so re-covering ground is wasted calls, never duplicates.
-    let minId = Number.isFinite(options.fromMessageId)
-      ? Math.min(options.fromMessageId, channel.last_message_id || 0)
-      : channel.last_message_id || 0;
-    let lastMessageId = channel.last_message_id || 0;
-    let lastMessageDate = channel.last_message_date || null;
-    let oldestMessageId = channel.oldest_message_id || null;
-    let oldestMessageDate = channel.oldest_message_date || null;
+    // A recorded gap starts below the cursor. Any sync of the channel fills it.
+    const fillingGap = channel.gap_after_message_id !== null;
+    let lastMessageId = fillingGap ? channel.gap_after_message_id : (channel.last_message_id || 0);
+    // A subscriber replaying from further back than the cursor pages from its own
+    // floor; inserts are idempotent. Only a positive floor: the client reads
+    // afterId 0 as "the newest page", which would skip a recorded gap and close it.
+    if (Number.isFinite(options.fromMessageId) && options.fromMessageId > 0) {
+      lastMessageId = Math.min(lastMessageId, options.fromMessageId);
+    }
+    let cursorBeforeLastPage = channel.last_message_id;
     let hasMoreNewer = false;
     let stoppedEarly = false;
     let peerTitle = channel.peer_title;
@@ -3731,10 +5346,14 @@ export default class MessageSyncService {
         stoppedEarly = true;
         break;
       }
+      // Pages go oldest first and the cursor moves after each one, so it only ever
+      // passes archived messages and an interrupted run resumes without a hole. With no
+      // cursor yet this returns the newest batch: older history is _backfillHistory's.
+      cursorBeforeLastPage = this._getChannel(normalizedId).last_message_id;
       const { peerTitle: title, peerType: type, messages } = await this.telegramClient.getMessagesByChannelId(
         normalizedId,
         this.batchSize,
-        { minId },
+        { afterId: lastMessageId },
       );
 
       if (this.stopRequested) {
@@ -3746,7 +5365,7 @@ export default class MessageSyncService {
       peerType = type ?? peerType;
 
       const newMessages = messages
-        .filter((msg) => msg.id > minId)
+        .filter((msg) => msg.id > lastMessageId)
         .sort((a, b) => a.id - b.id);
 
       if (!newMessages.length) {
@@ -3754,33 +5373,29 @@ export default class MessageSyncService {
         break;
       }
 
-      const userRecords = new Map();
-      for (const message of newMessages) {
-        const userRecord = this._buildUserRecordFromSerialized(message);
-        if (userRecord) {
-          userRecords.set(userRecord.user_id, userRecord);
-        }
-      }
-
-      const records = newMessages.map((msg) => this._buildMessageRecord(normalizedId, msg));
-      this.insertMessagesTx(records);
-      if (userRecords.size) {
-        this.upsertUsersTx([...userRecords.values()]);
-      }
+      const addedCount = this.archiveHistoryMessages(normalizedId, newMessages);
+      this._queueRecheckOfSkipped(normalizedId, lastMessageId, newMessages);
 
       const newest = newMessages[newMessages.length - 1];
       const oldest = newMessages[0];
 
       lastMessageId = newest.id;
-      lastMessageDate = toIsoString(newest.date) || lastMessageDate;
 
-      if (!oldestMessageId || oldest.id < oldestMessageId) {
-        oldestMessageId = oldest.id;
-        oldestMessageDate = toIsoString(oldest.date) || oldestMessageDate;
-      }
+      this._updateChannelCursors(normalizedId, {
+        lastMessageId: newest.id,
+        lastMessageDate: toIsoString(newest.date),
+        oldestMessageId: oldest.id,
+        oldestMessageDate: toIsoString(oldest.date),
+      });
 
-      minId = newest.id;
       hasMoreNewer = newMessages.length >= this.batchSize;
+      // The start moves up with each page, so an interrupted fill loses nothing.
+      if (fillingGap) {
+        this._setChannelGapStart(normalizedId, newest.id);
+        this.stats?.count('gaps.pages');
+        this.stats?.count('gaps.added', addedCount);
+        console.log(`[sync] Channel ${normalizedId}: gap filled up to message ${newest.id}, ${addedCount} new.`);
+      }
 
       if (!hasMoreNewer || this.stopRequested) {
         if (this.stopRequested) {
@@ -3789,7 +5404,12 @@ export default class MessageSyncService {
         break;
       }
 
+      console.log(`[sync] Channel ${normalizedId}: archived up to message ${newest.id}, fetching newer.`);
       await delay(this.interBatchDelayMs);
+    }
+
+    if (!stoppedEarly) {
+      this.db.prepare('UPDATE channels SET newer_sync_pending = 0 WHERE channel_id = ?').run(normalizedId);
     }
 
     const resolvedTitle = normalizeIncomingTitle(peerTitle);
@@ -3804,17 +5424,22 @@ export default class MessageSyncService {
       });
     }
 
-    this._updateChannelCursors(normalizedId, {
-      lastMessageId,
-      lastMessageDate,
-      oldestMessageId,
-      oldestMessageDate,
-    });
+    if (fillingGap && !stoppedEarly) {
+      // An update that moved the cursor while the last page was on its way may have passed
+      // messages that page could not show, so the fill has not caught up with the cursor.
+      if (this._getChannel(normalizedId).last_message_id > Math.max(cursorBeforeLastPage, lastMessageId)) {
+        this._setChannelGapStart(normalizedId, lastMessageId);
+      } else {
+        this._queueRecheckUpToCursor(normalizedId, lastMessageId);
+        this._closeChannelGap(normalizedId);
+        this.stats?.count('gaps.closed');
+        console.log(`[sync] Channel ${normalizedId}: gap closed.`);
+      }
+    }
 
     return {
       hasMoreNewer,
       lastMessageId,
-      oldestMessageId,
       stoppedEarly,
     };
   }
