@@ -263,6 +263,24 @@ describe('reconcileChannelsAgainstLive', () => {
 });
 
 describe('review fixes', () => {
+  it('ignores a zero floor, which would page from the newest batch and close a recorded gap', async () => {
+    // since=0 from /subscribe reaches here as fromMessageId 0. The client reads
+    // afterId 0 as "newest page", so paging from it skips the gap, and the run
+    // then closes the gap with 101..900 never archived.
+    seedChannel(MARKED_ID, 100);
+    service._markChannelGap(MARKED_ID);
+    telegramClient.getMessagesByChannelId.mockImplementation(async (_id, _limit, { afterId }) => ({
+      peerTitle: 'Test Chat',
+      peerType: 'channel',
+      messages: afterId === 0 ? liveMessages([999, 1000]) : [],
+    }));
+
+    await service._syncNewerMessages(MARKED_ID, { fromMessageId: 0 });
+
+    expect(telegramClient.getMessagesByChannelId.mock.calls[0][2]).toEqual({ afterId: 100 });
+    expect(archivedIds(MARKED_ID)).not.toContain(1000);
+  });
+
   it('_syncNewerMessages honours a caller floor below the cursor', async () => {
     seedChannel(MARKED_ID, 500);
     telegramClient.getMessagesByChannelId.mockResolvedValue({
