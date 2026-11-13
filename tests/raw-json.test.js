@@ -285,6 +285,19 @@ describe('MessageSyncService raw_json storage', () => {
     expect(second.rowsRewritten).toBe(0);
   });
 
+  it('keeps the rewrite stats when VACUUM cannot run', () => {
+    insertLegacyRow(1, 'photo');
+    service._assertFreeSpaceForVacuum = () => {
+      throw new Error('VACUUM needs ~9 GB free');
+    };
+
+    const stats = service.compactRawJson({ vacuum: true });
+
+    expect(stats.rowsRewritten).toBe(1);
+    expect(stats.vacuumed).toBe(false);
+    expect(stats.vacuumError).toMatch(/VACUUM needs/);
+  });
+
   it('compactRawJson with vacuum shrinks the database file', () => {
     for (let i = 1; i <= 400; i += 1) {
       insertLegacyRow(i, `apartment ${i}`);

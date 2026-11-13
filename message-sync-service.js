@@ -4393,10 +4393,16 @@ export default class MessageSyncService {
     this.db.pragma('wal_checkpoint(TRUNCATE)');
 
     if (options.vacuum) {
-      this._assertFreeSpaceForVacuum();
-      this.db.exec('VACUUM');
-      this.db.pragma('wal_checkpoint(TRUNCATE)');
-      stats.vacuumed = true;
+      // The rewrite is committed by now; a VACUUM that cannot run must not cost
+      // the caller the stats of what was done.
+      try {
+        this._assertFreeSpaceForVacuum();
+        this.db.exec('VACUUM');
+        this.db.pragma('wal_checkpoint(TRUNCATE)');
+        stats.vacuumed = true;
+      } catch (error) {
+        stats.vacuumError = error?.message ?? String(error);
+      }
     }
     stats.fileBytesAfter = this._databaseFileBytes();
     return stats;

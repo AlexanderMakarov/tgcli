@@ -141,12 +141,12 @@ Override the location with `TGCLI_STORE`.
 Each archived message keeps the full Telegram payload in `messages.raw_json`. Stores created before the compact `raw_json` format hold it about 1.5x larger than needed (binary fields were written as `{"0":1,"1":24,…}` index maps). Rewrite them once and return the space to the OS:
 
 ```bash
-tgcli service stop        # compaction needs exclusive access to the store
+tgcli service stop        # or `tgcli server stop` for a server the CLI auto-started
 tgcli store compact       # rewrites raw_json in batches, then VACUUMs
 tgcli service start
 ```
 
-`VACUUM` needs free disk of up to about twice the remaining data; the command checks this before starting. Use `--no-vacuum` to only rewrite rows. Expect a few minutes per million messages.
+Compaction needs the store to itself: it refuses to start while a server is running, and other commands will not auto-start one until it finishes. `VACUUM` needs free disk of up to about twice the remaining data; the command checks this before running it, and if it cannot run, the rewritten rows are kept and a later `tgcli store compact` releases the space. Use `--no-vacuum` to only rewrite rows. Expect roughly 6 minutes per million messages plus the VACUUM.
 
 Legacy version: see `MIGRATION.md`.
 
