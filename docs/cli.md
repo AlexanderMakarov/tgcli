@@ -12,8 +12,12 @@ connection and open database over the loopback control API, then renders the
 result. The server is the single writer; the auto-started server shuts itself
 down once the queue drains and nothing is watched.
 
-Commands that stay local (no server): `config`, `service`, `doctor`, and `auth`
+Commands that do not run on the server: `config`, `service`, `doctor`, and `auth`
 (interactive login bootstraps the session the server then uses).
+
+Before any command other than `server` and `service` runs, the CLI checks the
+version of a running server and replaces an outdated one it started itself, also
+for the commands above (see `server` below).
 
 ## Global flags
 - --json
@@ -39,6 +43,10 @@ MCP: disabled by default (set `mcp.enabled` in config.json to true to serve MCP)
 - auth logout
 
 ## backfill
+A chat given by username is archived under its Telegram id, which the server asks
+Telegram for; a username Telegram does not know is an error and queues nothing. The
+same goes for `channels watch`, `tags set` and `topics`.
+
 Backfill work is executed by the always-on control server, not in the CLI
 process. Commands that need the server (`backfill --chat`, `backfill wait`)
 auto-start `tgcli server --idle-exit 60s` in the background if one isn't already
@@ -67,6 +75,18 @@ one-shot client.
 - backfill cancel --chat <id|username>
   - Cancel a chat's backfills via the server when one is up; falls back to a
     direct cancel (same as `backfill jobs cancel --channel`) when none is.
+- backfill repair --chat <id|username>|--all [--since ISO|7d] [--after-id N] [--dry-run] [--background]
+  - Fill holes that older versions left in the archive: walk the chat's history from
+    the newest message down to the bound and write back what the archive lacks.
+    Cursors stay put, and it goes no further back than when the chat entered the
+    archive: older history is what `backfill --depth` is for. Without a bound it reads
+    the last 30 days; `--since` takes an ISO date or a duration with a unit (`7d`), and
+    `--after-id` alone sets no date bound. `--all` leaves out chats the last dialog list
+    did not have (ones the account left); `--chat` still takes them. Runs on the server
+    between its other jobs, one page a second; follows progress like `backfill --chat`,
+    and Ctrl-C detaches. A chat Telegram refuses to read is skipped; exits non-zero if a
+    repair fails. `--dry-run` reads the same pages and only counts what is missing; it
+    costs as many requests as the repair itself. See [archive-recovery.md](archive-recovery.md).
 - backfill (no --chat): track the server's queue (alias: `sync`)
   - `--follow`: auto-start the server if needed, track the queue with live
     progress, and exit once it drains. The server keeps running on its own
@@ -82,8 +102,71 @@ one-shot client.
 - `sync` remains a silent alias of `backfill` (and every subcommand), so existing `sync …` invocations keep working unchanged.
 
 ## server
-- server
+- server [--idle-exit DURATION]
   - Start the background sync service (MCP HTTP server runs only when enabled in config).
+  - Writes everything the server prints to `server.log` in the store, also when it
+    runs in the background and including a failure to start; at 5 MB the file moves
+    to `server.log.1` and a new one starts.
+- server stop [--force]
+  - Ask the running server to shut down (over the control API; SIGTERM for an older
+    server) and wait until its process has exited. Requests other CLIs are waiting on
+    get up to 10 seconds to finish, and the job it was backfilling goes back to the
+    queue. `--force` kills a server that has not exited after a minute. Prints
+    `No tgcli server is running.` and exits 0 when there is none.
+  - `--json`: `{ running, stopped, server: { pid, version, autoStarted, manager, method } }`.
+- server restart [--force]
+  - Stop the running server, if any, and start this CLI's version in its place. A
+    server run by `tgcli service` is left for its service manager to start again;
+    if it has not within 10 seconds, the command fails and says to run
+    `tgcli service start`.
+  - `--json`: `{ previous: { pid, version, ... } | null, current: { pid, version, startedAt } }`.
+- server logs [-n N] [--follow]
+  - Print the last N lines of the server log (default 100). `--follow` keeps printing
+    new lines, across rotations, until Ctrl-C or `--timeout`.
+  - `--json`: `{ path, exists, lines }`; with `--follow`, one `{ "line": ... }` object
+    per line.
+
+- server stats [--json]
+  - Counters of the running server, since it started and over the last hour (whole
+    minutes, so the window is 59–60 minutes and its start is printed). Reads only: it
+    neither starts a server nor replaces an outdated one, and exits non-zero when none
+    is running. A server too old to keep counters says to restart it. Asking does not
+    count as activity, so it keeps no idle server up.
+  - Requests to Telegram, by MTProto method. Counted once, right below mtcute's
+    flood-wait and internal-error retries, so each retry counts too. A resend mtcute
+    makes inside one send (a DC migration) counts once, and a call that fails before
+    it is sent (no connection) still counts, with its error.
+  - Request errors by name and method (`FLOOD_WAIT_23` counts as `FLOOD_WAIT`; a
+    request that throws, such as a timeout, counts under the exception's class, e.g.
+    `MtTimeoutError`), and the flood waits with the seconds Telegram asked for.
+  - Held back by mtcute: after a flood wait longer than it sleeps through, mtcute
+    answers further calls of that method with the remembered `FLOOD_WAIT` itself,
+    without asking Telegram. Those calls are neither requests nor request errors and
+    are listed here instead (only when there are any).
+  - Deleted messages read again: ids queued (a difference called them deleted, or a page
+    of history skipped them), reads done, found alive, put back in the archive, reads
+    that failed, and ids given up on.
+  - `backfill repair`: pages read, messages checked and added (a `--dry-run` counts what
+    it would add separately), repairs finished, skipped (the chat is gone) and failed.
+  - Gaps after a too-long channel difference: pages that brought new messages, messages
+    added, gaps closed, fills that failed.
+  - Backfill jobs: passes, jobs finished, passes that failed.
+  - `--json` prints `{ pid, version, startedAt, at, sinceStart, lastHour }`; each of the
+    last two has `since`, `requests { total, byMethod }`,
+    `errors { total, floodWait { count, seconds }, byError, byMethod, heldBack { total, byMethod } }`,
+    `rechecks`, `repair`, `gaps` and `jobs`.
+  - Counters live in memory and start over with the server. Only method names, error
+    names and counts are kept.
+
+Every command except `server` and `service` checks the running server's version
+before it runs. A server that an older CLI started on its own is replaced by this
+version right away, unless it has backfill jobs queued or is answering another
+CLI's request; a newer server is left alone, and a server running from the CLI's
+own directory on another version is always replaced. A dev build run from a clone
+(`2.2.6-dev+<commit>`) counts as newer than the release it grew from, and while a CLI
+of that build has used its server in the last 10 minutes no other version replaces
+it. `server restart` switches to the caller's version in any direction. See
+`docs/development.md`.
 
 ## service
 - service install
@@ -94,15 +177,82 @@ one-shot client.
 
 ## doctor
 - doctor [--connect]
-  - Checks auth, lock, FTS, last sync, queue state.
+  - Checks auth, lock, FTS, last sync, queue state. For an archive started before 2.2.5,
+    suggests `backfill repair --all` until it has run.
+  - `USERNAME KEYS:` counts chats an older version stored under a username (a chat
+    given as `--chat @name`) instead of its Telegram id, next to the rows updates write
+    by id. The server moves each to its id after it logs in to Telegram, with nothing
+    to run: messages already under the id stay, duplicates are dropped, jobs and
+    repairs carry over. When Telegram no longer knows the username, the messages under
+    it decide: if they all come from one chat (each archived message records its chat),
+    they move there; with no message under it at all, its rows are dropped along with
+    its jobs and repairs, which could never run. A chat whose messages come from several
+    chats, or from another one than Telegram gives for the username, stays as it is.
+    One line per chat says what becomes of it, naming the reason for a chat that stays.
+    With `--json` the list is under `usernameKeys`.
+  - The `UPDATE:` line reports what the last update check found: a newer version
+    and the command that installs it, `up to date` with the time that version was
+    last confirmed, `not checked yet`, or why there is no check, plus the error of a
+    failed last check. With `--json` the same facts are under `update`.
+  - `LEFT:` counts chats whose sync the server turned off because you left them (see
+    `channels unwatch`), and `DIALOGS:` the synced chats missing from your dialog list
+    that Telegram says you are still in. With `--json`: `leftChats`.
+  - `UNANSWERED:` lists synced chats missing from your dialog list that Telegram gives
+    no answer about, most often a private chat you were removed from (Telegram refuses
+    it the same way it refuses a stale access hash, so the server does not act on it).
+    Nothing arrives from them; `channels unwatch --missing` turns them all off. With
+    `--json`: `unansweredChats`.
+
+## Update notice
+Once a day tgcli asks the npm registry for the latest `@alexandermakarov/tgcli` and keeps the
+answer in `update-check.json` in the store. The request runs in a detached background
+process, so no command waits for it; the notice is decided from the cache alone, which
+means a new release shows up on the first command after the check that found it.
+
+When the cache knows a newer version, one line goes to stderr after a command
+succeeds, with the command for how this copy was installed:
+
+```
+Update available: tgcli 2.2.5 -> 2.3.0. Run `brew update && brew upgrade tgcli` (TGCLI_NO_UPDATE_CHECK=1 turns this notice off).
+```
+
+- Install method comes from where the package sits: under Homebrew's `Cellar/tgcli`
+  the command is `brew update && brew upgrade tgcli` (Homebrew refreshes taps only
+  once a day on its own, so a bare `brew upgrade` can miss a release made today);
+  under a global npm `lib/node_modules` (or `%AppData%\npm\node_modules` on
+  Windows) it is `npm i -g @alexandermakarov/tgcli`. Anything else (a git clone, an npx
+  cache, a project dependency, pnpm, the Nix store) gets no check and no notice.
+  So does a version with a prerelease suffix such as `2.3.0-dev`.
+- Never on stdout. Never with `--json` or `--quiet`, never after a failed command,
+  and only when stderr is a terminal: pipes, redirects, cron and agents that capture
+  output see nothing. An agent that drives a real terminal sees the line like a
+  person would, at most once a day; `--json` or the switch below keeps it out.
+  The background check still runs without a terminal, so the notice is ready when a
+  person next runs tgcli.
+- Shown at most once a day for the same version; a newer release shows at once.
+- Not in `tgcli server`, which neither checks nor prints. `doctor` checks but prints
+  its `UPDATE:` line instead of the notice.
+- Off entirely, check included, when `TGCLI_NO_UPDATE_CHECK`, `NO_UPDATE_NOTIFIER` or
+  `CI` is set to a value other than empty, `0`, `false`, `no` or `off`.
+- The release workflow updates the Homebrew formula right after npm. If that step
+  fails, Homebrew users see the notice before `brew upgrade` can install the release.
 
 ## channels
 - channels list [--limit] [--query]
 - channels show --chat <id|username>
 - channels watch --chat <id|username>
   - Subscribe a chat for archiving: enables sync and queues a backfill job; run `tgcli backfill --once` or `tgcli backfill --follow` to process it.
-- channels unwatch --chat <id|username>
-  - Unsubscribe a chat from archiving (disables sync).
+- channels unwatch --chat <id|username> | --missing
+  - Unsubscribe a chat from archiving (disables sync). `--missing` does it for every
+    chat `doctor` lists under `UNANSWERED:`.
+  - The server does this by itself for a channel or group you left: Telegram sends
+    nothing from it, so the archive could not keep up. A synced chat missing from the
+    dialog list is only a reason to ask Telegram, once a day; sync goes off when Telegram
+    says you left or were removed, or the chat is gone, and comes back on, with what it
+    missed, when the chat returns to your dialog list. Chats you asked for yourself
+    (`channels watch`, `backfill --chat`) are never turned off this way, so a public
+    channel archived without joining keeps its sync; chats you turned off stay off, and
+    private chats are never asked about.
   - `channels sync --chat <id|username> --enable|--disable` remains as a hidden alias of watch/unwatch.
 
 ## topics (forum supergroups)
@@ -211,3 +361,7 @@ Legacy `--offset-id` is accepted as a hidden alias for `--before-id`.
 - folders join <link>
 
 `<folder>` can be a numeric folder ID or folder title.
+
+## Recovering archive gaps
+`tgcli backfill repair` fills gaps that older versions left in the archive.
+See [archive-recovery.md](archive-recovery.md).

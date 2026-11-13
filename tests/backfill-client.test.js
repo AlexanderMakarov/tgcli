@@ -13,6 +13,8 @@ const control = vi.hoisted(() => ({
   enqueueBackfill: vi.fn(() => Promise.resolve({ jobId: 11, channelId: '-100', status: 'pending' })),
   cancelBackfill: vi.fn(() => Promise.resolve({ canceled: 1, jobIds: [11] })),
   retryBackfill: vi.fn(() => Promise.resolve({ updated: 2, jobIds: [11, 12] })),
+  enqueueRepair: vi.fn(() => Promise.resolve({ channelIds: ['-100'] })),
+  syncServerVersion: vi.fn(() => Promise.resolve('current')),
 }));
 
 vi.mock('../core/services.js', () => ({
@@ -43,6 +45,7 @@ function makeFakeServices(overrides = {}) {
     getQueueStats: vi.fn(() => ({ pending: 0, in_progress: 0, idle: 0, error: 0, processing: false })),
     getJobCounts: vi.fn(() => ({ pending: 0, inProgress: 0 })),
     listJobs: vi.fn(() => []),
+    listRepairs: vi.fn(() => []),
     cancelJobs: vi.fn(() => ({ canceled: 1, jobIds: [11] })),
     shutdown: vi.fn().mockResolvedValue(undefined),
     ...overrides,
@@ -81,6 +84,7 @@ afterEach(() => {
   control.enqueueBackfill.mockResolvedValue({ jobId: 11, channelId: '-100', status: 'pending' });
   control.cancelBackfill.mockResolvedValue({ canceled: 1, jobIds: [11] });
   control.retryBackfill.mockResolvedValue({ updated: 2, jobIds: [11, 12] });
+  control.enqueueRepair.mockResolvedValue({ channelIds: ['-100'] });
   vi.clearAllMocks();
 });
 
@@ -96,7 +100,7 @@ describe('backfill --chat (server-executed)', () => {
     services.current = makeFakeServices();
     await runProgram(['--json', 'backfill', '--chat', '@chan', '--depth', '50', '--background']);
 
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s' });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     expect(control.enqueueBackfill).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
       chatId: '@chan',
       depth: 50,
@@ -204,6 +208,240 @@ describe('backfill status', () => {
     expect(out).toContain('SERVER: up (pid 7)');
     expect(out).toContain('Chan [in_progress] 40/100 (40%)');
   });
+
+  it('brings a server on another version to this one before reporting it', async () => {
+    services.current = makeFakeServices();
+    const order = [];
+    control.syncServerVersion.mockImplementation(async () => {
+      order.push('sync');
+      return 'replaced';
+    });
+    control.pingServer.mockImplementation(async () => {
+      order.push('ping');
+      return { ok: true, pid: 8, version: '3' };
+    });
+
+    await runProgram(['backfill', 'status']);
+    expect(control.syncServerVersion).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
+    expect(order).toEqual(['sync', 'ping']);
+    expect(logSpy.mock.calls.flat().join('\n')).toContain('SERVER: up (pid 8)');
+  });
+});
+
+describe('server version check before every command', () => {
+  afterEach(() => {
+    process.exitCode = 0;
+  });
+
+  it('runs before doctor, which never talks to the server', async () => {
+    services.current = makeFakeServices();
+    await runProgram(['--quiet', 'doctor']).catch(() => {});
+    expect(control.syncServerVersion).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: true });
+  });
+
+  it.each([
+    ['server stop', ['server', 'stop']],
+    ['server logs', ['server', 'logs']],
+  ])('leaves %s to manage the server itself', async (_label, argv) => {
+    await runProgram(argv).catch(() => {});
+    expect(control.syncServerVersion).not.toHaveBeenCalled();
+  });
+
+  it('does not block the command when the check fails', async () => {
+    services.current = makeFakeServices();
+    control.syncServerVersion.mockRejectedValueOnce(new Error('ps exploded'));
+    await runProgram(['backfill', 'status']);
+    expect(stderrText()).toContain('could not bring tgcli server to this version: ps exploded');
+    expect(logSpy.mock.calls.flat().join('\n')).toContain('QUEUE:');
+  });
+});
+
+describe('backfill repair', () => {
+  const repair = (fields) => ({
+    channel_id: '-100',
+    peer_title: 'Chan',
+    status: 'in_progress',
+    checked_count: 0,
+    added_count: 0,
+    cursor_message_id: null,
+    error: null,
+    ...fields,
+  });
+
+  afterEach(() => {
+    process.exitCode = 0;
+  });
+
+  it('queues one chat for the last 30 days on the server and follows it to the end', async () => {
+    const listRepairs = vi
+      .fn()
+      .mockReturnValueOnce([repair({ checked_count: 100, added_count: 1 })])
+      .mockReturnValue([repair({ status: 'idle', checked_count: 250, added_count: 2 })]);
+    services.current = makeFakeServices({ listRepairs });
+    const before = Math.floor(Date.now() / 1000);
+
+    await runProgram(['backfill', 'repair', '--chat', '@chan']);
+
+    expect(control.ensureServer).toHaveBeenCalled();
+    const [storeDir, request] = control.enqueueRepair.mock.calls[0];
+    expect(storeDir).toBe('/tmp/tgcli-test-store');
+    expect(request).toMatchObject({ chats: ['@chan'], all: false, afterId: 0 });
+    expect(before - request.sinceDate).toBeGreaterThanOrEqual(30 * 86400 - 1);
+    expect(before - request.sinceDate).toBeLessThanOrEqual(30 * 86400 + 1);
+    expect(listRepairs).toHaveBeenCalledWith({ channelIds: ['-100'] });
+    expect(stderrText()).toContain('Repairing Chan: checked 100, added 1');
+    expect(logSpy.mock.calls.flat().join(' ')).toContain('Chan: checked 250, added 2.');
+    expect(process.exitCode).not.toBe(1);
+  });
+
+  it('takes an ISO date for --since, and no date bound with --after-id alone', async () => {
+    services.current = makeFakeServices({ listRepairs: vi.fn(() => [repair({ status: 'idle' })]) });
+
+    await runProgram(['backfill', 'repair', '--all', '--since', '2026-10-01']);
+    expect(control.enqueueRepair.mock.calls[0][1]).toEqual({
+      chats: [],
+      all: true,
+      afterId: 0,
+      sinceDate: Date.parse('2026-10-01') / 1000,
+      dryRun: false,
+    });
+
+    await runProgram(['sync', 'repair', '--chat', '-100', '--after-id', '500']);
+    expect(control.enqueueRepair.mock.calls[1][1]).toEqual({ chats: ['-100'], all: false, afterId: 500, sinceDate: null, dryRun: false });
+  });
+
+  it.each([
+    [['backfill', 'repair'], /either --chat/],
+    [['backfill', 'repair', '--chat', '-100', '--all'], /either --chat/],
+    [['backfill', 'repair', '--all', '--after-id', '5'], /--after-id works with --chat only/],
+    [['backfill', 'repair', '--chat', '-100', '--since', 'soon'], /--since must be/],
+    [['backfill', 'repair', '--chat', '-100', '--since', '30'], /--since must be/],
+  ])('refuses %j before touching the server', async (argv, message) => {
+    services.current = makeFakeServices();
+
+    await runProgram(argv);
+
+    expect(process.exitCode).toBe(1);
+    expect(stderrText()).toMatch(message);
+    expect(control.ensureServer).not.toHaveBeenCalled();
+    expect(control.enqueueRepair).not.toHaveBeenCalled();
+  });
+
+  it('exits non-zero and says why when a repair fails', async () => {
+    services.current = makeFakeServices({
+      listRepairs: vi.fn(() => [repair({ status: 'error', error: 'CHANNEL_PRIVATE' })]),
+    });
+
+    await runProgram(['backfill', 'repair', '--chat', '-100']);
+
+    expect(process.exitCode).toBe(1);
+    expect(errSpy.mock.calls.flat().join(' ')).toContain('Repair of Chan failed: CHANNEL_PRIVATE');
+  });
+
+  it('reports a chat Telegram refuses as skipped, not failed', async () => {
+    services.current = makeFakeServices({
+      listRepairs: vi.fn(() => [
+        repair({ status: 'idle', checked_count: 10, added_count: 3 }),
+        repair({ channel_id: '-200', peer_title: 'Left', status: 'skipped', error: "You haven't joined this channel/supergroup." }),
+      ]),
+    });
+
+    await runProgram(['backfill', 'repair', '--all']);
+
+    expect(process.exitCode).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain("Skipped Left: You haven't joined this channel/supergroup.");
+    expect(out).toContain('Repaired 1/2 chat(s), skipped 1, added 3 message(s).');
+  });
+
+  it('--dry-run asks the server for a dry run and reports what is missing', async () => {
+    services.current = makeFakeServices({
+      listRepairs: vi.fn(() => [
+        repair({ status: 'idle', dry_run: 1, checked_count: 40, added_count: 3 }),
+        repair({ channel_id: '-200', peer_title: 'Whole', status: 'idle', dry_run: 1, checked_count: 9 }),
+      ]),
+    });
+
+    await runProgram(['backfill', 'repair', '--all', '--dry-run']);
+
+    expect(control.enqueueRepair.mock.calls[0][1]).toMatchObject({ all: true, dryRun: true });
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('Chan: checked 40, missing 3.');
+    expect(out).toContain('Checked 2/2 chat(s), missing 3 message(s).');
+    expect(out).toContain('Dry run: nothing written.');
+  });
+
+  it('--background --json returns the queued chats without following them', async () => {
+    services.current = makeFakeServices();
+
+    await runProgram(['--json', 'backfill', 'repair', '--all', '--background']);
+
+    expect(services.current.messageSyncService.listRepairs).not.toHaveBeenCalled();
+    expect(JSON.parse(stdoutText())).toEqual({ ok: true, channelIds: ['-100'] });
+  });
+
+  it('status sums up the repairs and names the one under way', async () => {
+    services.current = makeFakeServices({
+      listRepairs: vi.fn(() => [
+        repair({ checked_count: 300, added_count: 4 }),
+        repair({ channel_id: '-200', peer_title: 'Done', status: 'idle', checked_count: 10, added_count: 1 }),
+        repair({ channel_id: '-300', peer_title: 'Next', status: 'pending' }),
+        repair({ channel_id: '-400', peer_title: 'Left', status: 'skipped', error: 'gone' }),
+      ]),
+    });
+
+    await runProgram(['backfill', 'status']);
+
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('REPAIRS: 4 chat(s) idle=1 in_progress=1 pending=1 skipped=1 error=0 checked=310 added=5');
+    expect(out).toContain('repair Chan [in_progress] checked=300 added=4');
+    expect(out).not.toMatch(/repair (Done|Next|Left)/);
+  });
+
+  // `--all` queues every synced chat: a line each would bury the queue.
+  it('status names at most ten failed repairs', async () => {
+    const failed = Array.from({ length: 12 }, (_, index) => repair({
+      channel_id: `-${500 + index}`,
+      peer_title: `Failed ${index}`,
+      status: 'error',
+      error: 'boom',
+    }));
+    const pending = Array.from({ length: 1500 }, (_, index) => repair({ channel_id: `-${9000 + index}`, status: 'pending' }));
+    services.current = makeFakeServices({ listRepairs: vi.fn(() => [...failed, ...pending]) });
+
+    await runProgram(['backfill', 'status']);
+
+    const lines = logSpy.mock.calls.flat().join('\n').split('\n');
+    expect(lines.filter((line) => line.includes('[error]'))).toHaveLength(10);
+    expect(lines.filter((line) => line.includes('[pending]'))).toHaveLength(0);
+    expect(lines).toContain('  … and 2 more; `tgcli --json backfill status` lists them all.');
+  });
+
+  it('status names the chat under way before failures, and says missing for a dry run', async () => {
+    const failed = Array.from({ length: 11 }, (_, index) => repair({ channel_id: `-${500 + index}`, status: 'error', error: 'boom' }));
+    services.current = makeFakeServices({
+      listRepairs: vi.fn(() => [...failed, repair({ peer_title: 'Now', dry_run: 1, checked_count: 50, added_count: 6 })]),
+    });
+
+    await runProgram(['backfill', 'status']);
+
+    const lines = logSpy.mock.calls.flat().join('\n').split('\n');
+    expect(lines.find((line) => line.startsWith('  repair'))).toBe('  repair Now [in_progress] checked=50 missing=6');
+    expect(lines[0]).not.toContain('missing');
+    expect(lines.find((line) => line.startsWith('REPAIRS:'))).toContain('added=0 missing=6');
+  });
+
+  it('status --json adds totals to the full list', async () => {
+    services.current = makeFakeServices({
+      listRepairs: vi.fn(() => [repair({ status: 'idle', checked_count: 7, added_count: 2 })]),
+    });
+
+    await runProgram(['--json', 'backfill', 'status']);
+
+    const out = JSON.parse(stdoutText());
+    expect(out.repairTotals).toEqual({ chats: 1, byStatus: { idle: 1 }, checked: 7, added: 2, missing: 0 });
+    expect(out.repairs).toHaveLength(1);
+  });
 });
 
 describe('backfill cancel', () => {
@@ -211,7 +449,7 @@ describe('backfill cancel', () => {
     services.current = makeFakeServices();
 
     await runProgram(['backfill', 'cancel', '--chat', '@chan']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s' });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     expect(control.cancelBackfill).toHaveBeenCalledWith('/tmp/tgcli-test-store', { chatId: '@chan' });
     expect(control.pingServer).not.toHaveBeenCalled();
     expect(services.current.messageSyncService.cancelJobs).not.toHaveBeenCalled();
@@ -224,7 +462,7 @@ describe('backfill (no --chat): queue draining via the server', () => {
       getJobCounts: vi.fn(() => ({ pending: 0, inProgress: 0 })),
     });
     await runProgram(['backfill', '--once']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s' });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     // No in-process worker: never created services for queue processing, only the
     // brief read snapshot the drain poll uses.
     expect(services.current.messageSyncService.processQueue).toBeUndefined();
@@ -243,7 +481,7 @@ describe('backfill (no --chat): queue draining via the server', () => {
         : [])),
     });
     await runProgram(['sync', '--follow']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s' });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     expect(stderrText()).toContain('Backfilling Chan');
     expect(logSpy.mock.calls.flat().join(' ')).toContain('Backfill queue drained.');
   });
@@ -260,7 +498,7 @@ describe('backfill jobs add / retry / cancel route through the control API', () 
   it('jobs add enqueues via the control client (no in-process queue)', async () => {
     services.current = makeFakeServices();
     await runProgram(['backfill', 'jobs', 'add', '--chat', '@chan', '--depth', '5']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s' });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     expect(control.enqueueBackfill).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
       chatId: '@chan',
       depth: 5,
@@ -272,7 +510,7 @@ describe('backfill jobs add / retry / cancel route through the control API', () 
   it('jobs retry resets via the control client and lets the server process', async () => {
     services.current = makeFakeServices();
     await runProgram(['backfill', 'jobs', 'retry', '--all-errors']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s' });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     expect(control.retryBackfill).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
       jobId: null,
       channelId: null,
@@ -294,7 +532,7 @@ describe('backfill jobs add / retry / cancel route through the control API', () 
   it('jobs cancel by job id auto-starts and routes through the control client', async () => {
     services.current = makeFakeServices();
     await runProgram(['backfill', 'jobs', 'cancel', '--job-id', '42']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s' });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     expect(control.cancelBackfill).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
       jobId: 42,
       chatId: null,
@@ -305,7 +543,7 @@ describe('backfill jobs add / retry / cancel route through the control API', () 
   it('jobs cancel by channel auto-starts and routes through the control client', async () => {
     services.current = makeFakeServices();
     await runProgram(['backfill', 'jobs', 'cancel', '--channel', '@chan']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s' });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     expect(control.cancelBackfill).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
       jobId: null,
       chatId: '@chan',

@@ -54,9 +54,9 @@ beforeEach(() => {
     markChannelRead: vi.fn().mockResolvedValue({ channelId: '1', messageId: 9 }),
   };
   hooks.messageSyncService = {
+    resolveChatKey: vi.fn(async (chat) => (chat === '@g' ? '1' : String(chat))),
     setChannelSync: vi.fn(() => ({ channel_id: '1', sync_enabled: 1 })),
-    listJobs: vi.fn(() => []),
-    addJob: vi.fn(() => ({ id: 7, status: 'pending' })),
+    queueResyncJob: vi.fn(() => ({ job: { id: 7, status: 'pending' }, queued: true })),
     processQueue: vi.fn(),
   };
   hooks.ensureServer = vi.fn().mockResolvedValue({ ok: true });
@@ -93,9 +93,8 @@ describe('OPERATIONS registry', () => {
 
   it('channelSetSync enables sync and queues a backfill job when none exists', async () => {
     const result = await OPERATIONS.channelSetSync(ctx(), { chat: '@g', enable: true });
-    expect(hooks.messageSyncService.setChannelSync).toHaveBeenCalledWith('@g', true);
-    expect(hooks.messageSyncService.addJob).toHaveBeenCalledWith('@g');
-    expect(hooks.messageSyncService.processQueue).toHaveBeenCalledTimes(1);
+    expect(hooks.messageSyncService.setChannelSync).toHaveBeenCalledWith('1', true);
+    expect(hooks.messageSyncService.queueResyncJob).toHaveBeenCalledWith('1');
     expect(result).toMatchObject({ channelId: '1', syncEnabled: true, jobId: 7, jobQueued: true });
   });
 
@@ -236,7 +235,7 @@ describe('runOperation seam', () => {
 
     const result = await runOperation({}, { op: 'listChannels', args: { limit: 3 } });
 
-    expect(hooks.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-seam-store', { idleExit: '60s' });
+    expect(hooks.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-seam-store', {});
     expect(hooks.invoke).toHaveBeenCalledTimes(2);
     expect(result).toEqual([{ id: 'warm' }]);
   });
@@ -263,6 +262,17 @@ describe('runOperation seam', () => {
       args: { chat: '@g' },
       timeoutMs: 30000,
     });
+  });
+
+  it('passes --quiet to both the invoke and the server start', async () => {
+    hooks.invoke
+      .mockRejectedValueOnce(new ServerUnavailableError('none'))
+      .mockResolvedValueOnce([]);
+
+    await runOperation({ quiet: true }, { op: 'listChannels', args: {} });
+
+    expect(hooks.invoke).toHaveBeenCalledWith('/tmp/tgcli-seam-store', expect.objectContaining({ quiet: true }));
+    expect(hooks.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-seam-store', expect.objectContaining({ quiet: true }));
   });
 
   it('rejects an unknown operation before reaching the server', async () => {

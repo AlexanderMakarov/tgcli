@@ -12,6 +12,15 @@ import { acquireStoreLock, acquireReadLock, readStoreLock } from './store-lock.j
 import { loadConfig, normalizeConfig, saveConfig, validateConfig } from './core/config.js';
 import { createServices, createTelegramClient } from './core/services.js';
 import { withCommand, runWithTimeout, runOperation } from './core/command-context.js';
+import { readVersion } from './core/version.js';
+import {
+  detectInstallMethod,
+  formatDoctorUpdateLine,
+  getUpdateCheckDisabledReason,
+  getUpdateStatus,
+  maybePrintUpdateNotice,
+  scheduleUpdateCheck,
+} from './core/update-check.js';
 import {
   buildSendErrorPayload,
   buildSendSuccessPayload,
@@ -22,13 +31,21 @@ import {
 } from './core/send-utils.js';
 import { resolveStoreDir } from './core/store.js';
 import { parseDuration } from './core/duration.js';
+import { formatServerStats } from './core/server-stats.js';
 import {
   cancelBackfill,
   enqueueBackfill,
+  enqueueRepair,
   ensureServer,
+  fetchServerStats,
+  isManagedServer,
   pingServer,
+  restartServer,
   retryBackfill,
+  stopServer,
+  syncServerVersion,
 } from './core/control-client.js';
+import { appendServerLog, followServerLog, openServerLog, readServerLogTail } from './core/server-log.js';
 
 const CLI_PATH = fileURLToPath(import.meta.url);
 const SERVICE_STATE_FILE = 'service-state.json';
@@ -38,6 +55,9 @@ const SERVICE_STATE_FILE = 'service-state.json';
 // Safe here — this is a Linux/systemd deployment with no launchd agent.
 const LAUNCHD_LABEL = 'com.alexandermakarov.tgcli';
 const SYSTEMD_SERVICE_NAME = 'tgcli';
+// How far back `backfill repair` reads when given no bound.
+const DEFAULT_REPAIR_SINCE = '30d';
+const REPAIR_PROGRESS_INTERVAL_MS = 5000;
 const AUTH_SYNC_HINT = 'Run `tgcli backfill --once` or `tgcli backfill --follow` when you need archive data.';
 const CONFIG_SPECS = [
   { key: 'apiId', path: ['apiId'], type: 'number' },
@@ -61,6 +81,7 @@ const DEFAULT_SEND_RETRIES = 2;
 const DEFAULT_SEND_TIMEOUT_MS = 30000;
 const FEEDBACK_LAST_FILE = 'feedback-last.json';
 const FEEDBACK_COOLDOWN_MS = 60 * 1000;
+const DEFAULT_SERVER_LOG_LINES = 100;
 
 const CLI_PROGRAM = buildProgram();
 
@@ -167,6 +188,20 @@ function buildProgram() {
     .action(withGlobalOptions((globalFlags, options, command) =>
       runBackfillCancel(globalFlags, command.optsWithGlobals()),
     ));
+  sync
+    .command('repair')
+    .description('Fill holes in the archive from Telegram history (cursors stay put)')
+    // --chat and --background are also declared on the parent `backfill`; read them
+    // through optsWithGlobals, as `backfill cancel` does.
+    .option('--chat <id|username>', 'Chat to repair')
+    .option('--all', 'Repair every chat with sync enabled')
+    .option('--since <date|duration>', `Lower bound: ISO date or duration such as 7d (default ${DEFAULT_REPAIR_SINCE})`)
+    .option('--after-id <id>', 'Lower bound: only messages above this id (with --chat; no default date bound)')
+    .option('--dry-run', 'Count what is missing without writing anything')
+    .option('--background', 'Enqueue and return immediately')
+    .action(withGlobalOptions((globalFlags, options, command) =>
+      runBackfillRepair(globalFlags, command.optsWithGlobals()),
+    ));
   const syncJobs = sync.command('jobs').description('Manage sync jobs');
   syncJobs
     .command('list')
@@ -202,11 +237,34 @@ function buildProgram() {
     .option('--channel <id|username>', 'Cancel by channel')
     .action(withGlobalOptions((globalFlags, options) => runSyncJobsCancel(globalFlags, options)));
 
-  program
+  const server = program
     .command('server')
     .description('Run background sync service (MCP optional)')
     .option('--idle-exit <duration>', 'Exit after this idle period with no jobs or watched channels')
+    .addOption(new Option('--auto-started').hideHelp())
+    // `server stat` must not start a second server.
+    .allowExcessArguments(false)
     .action(withGlobalOptions((globalFlags, options) => runServer(globalFlags, options)));
+  server
+    .command('stop')
+    .description('Stop the running server and wait until it has exited')
+    .option('--force', 'Kill the server if it has not exited after a minute')
+    .action(withGlobalOptions((globalFlags, options) => runServerStop(globalFlags, options)));
+  server
+    .command('restart')
+    .description("Restart the server on this CLI's version")
+    .option('--force', 'Kill the old server if it has not exited after a minute')
+    .action(withGlobalOptions((globalFlags, options) => runServerRestart(globalFlags, options)));
+  server
+    .command('logs')
+    .description('Show the end of the server log')
+    .option('-n, --lines <n>', `Number of lines to show (default ${DEFAULT_SERVER_LOG_LINES})`)
+    .option('--follow', 'Keep printing lines as the server writes them')
+    .action(withGlobalOptions((globalFlags, options) => runServerLogs(globalFlags, options)));
+  server
+    .command('stats')
+    .description('Show what the running server asked Telegram and did, since start and over the last hour')
+    .action(withGlobalOptions((globalFlags) => runServerStats(globalFlags)));
 
   const service = program.command('service').description('Manage background service');
   service
@@ -271,8 +329,9 @@ function buildProgram() {
     .command('unwatch')
     .description('Unsubscribe a chat from archiving (disable sync)')
     .option('--chat <id|username>', 'Channel identifier')
+    .option('--missing', 'Every chat doctor lists as missing from your dialogs with no answer from Telegram')
     .action(withGlobalOptions((globalFlags, options) =>
-      runChannelsSync(globalFlags, { ...options, disable: true }),
+      (options.missing ? runChannelsUnwatchMissing(globalFlags, options) : runChannelsSync(globalFlags, { ...options, disable: true })),
     ));
   // Hidden back-compat alias of watch/unwatch via explicit --enable/--disable.
   channels
@@ -656,7 +715,47 @@ function buildProgram() {
   program.action(() => {
     program.help();
   });
+  program.hook('preAction', (_program, actionCommand) => keepServerOnThisVersion(actionCommand));
   return program;
+}
+
+// `server` and `service` commands start, stop and replace servers themselves.
+function managesServerItself(command) {
+  for (let current = command; current?.parent; current = current.parent) {
+    if (current.name() === 'server' || current.name() === 'service') {
+      return true;
+    }
+  }
+  return !command?.parent;
+}
+
+// Before any command runs, a server on another version is replaced by this one
+// (see syncServerVersion). A failed check never blocks the command itself, and
+// --timeout bounds it like the command.
+async function keepServerOnThisVersion(actionCommand) {
+  if (managesServerItself(actionCommand)) {
+    return;
+  }
+  let globalFlags;
+  try {
+    globalFlags = getGlobalFlags(actionCommand);
+  } catch {
+    // The command reports its own bad flags.
+    return;
+  }
+  const { quiet } = globalFlags;
+  try {
+    await runWithTimeout(
+      () => syncServerVersion(resolveStoreDir(), { quiet }),
+      globalFlags.timeoutMs,
+      undefined,
+      `timed out after ${globalFlags.timeout}`,
+    );
+  } catch (error) {
+    if (!quiet) {
+      process.stderr.write(`Warning: could not bring tgcli server to this version: ${error?.message ?? error}\n`);
+    }
+  }
 }
 
 function collectOption(value, previous) {
@@ -1111,16 +1210,6 @@ function resolveServiceManager() {
   return { manager: 'unsupported', brewInfo };
 }
 
-function readVersion() {
-  try {
-    const pkgPath = new URL('./package.json', import.meta.url);
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-    return pkg.version || '0.0.0';
-  } catch (error) {
-    return '0.0.0';
-  }
-}
-
 function promptInput(question) {
   const rl = readline.createInterface({
     input: process.stdin,
@@ -1561,6 +1650,8 @@ async function runFeedback(globalFlags, messageParts, options = {}) {
 // A backfill job is terminal once the worker stops touching it: `idle` means the
 // backfill reached its target/exhausted history; `error` means it failed.
 const TERMINAL_JOB_STATUSES = new Set(['idle', 'error']);
+// A skipped repair is one Telegram refuses for good, such as in a chat the account left.
+const TERMINAL_REPAIR_STATUSES = new Set([...TERMINAL_JOB_STATUSES, 'skipped']);
 
 // Briefly take a read lock, read job state, then release — never held across a
 // poll loop. Holding it for the whole wait would block CLI writers like `send`,
@@ -1601,6 +1692,10 @@ function writeProgress(globalFlags, line) {
   }
 }
 
+function ensureAutoStartedServer(globalFlags, storeDir) {
+  return ensureServer(storeDir, { quiet: globalFlags.quiet });
+}
+
 // With `--chat`, enqueue a single-chat backfill on the always-on control server
 // (auto-starting it) and either return the job id (`--background`) or follow
 // progress in the foreground. Without `--chat`, delegate to the queue-draining
@@ -1617,7 +1712,7 @@ async function runBackfill(globalFlags, options = {}) {
     const depth = parsePositiveInt(options.depth, '--depth');
     const minDate = options.minDate ?? null;
 
-    await ensureServer(storeDir, { idleExit: '60s' });
+    await ensureAutoStartedServer(globalFlags, storeDir);
     const enqueued = await enqueueBackfill(storeDir, {
       chatId: options.chat,
       depth,
@@ -1714,7 +1809,7 @@ async function runBackfillCount(globalFlags) {
 // progress to stderr along the way. The server keeps running on its own (realtime
 // continues while it is up / has watched chats); this only tracks the queue.
 async function drainBackfillQueue(globalFlags, storeDir) {
-  await ensureServer(storeDir, { idleExit: '60s' });
+  await ensureAutoStartedServer(globalFlags, storeDir);
   while (true) {
     const { active, jobs } = withReadSnapshot(storeDir, (service) => {
       const counts = service.getJobCounts();
@@ -1752,12 +1847,180 @@ async function runBackfillCancel(globalFlags, options = {}) {
       throw new Error('--chat is required');
     }
     const storeDir = resolveStoreDir();
-    await ensureServer(storeDir, { idleExit: '60s' });
+    await ensureAutoStartedServer(globalFlags, storeDir);
     const result = await cancelBackfill(storeDir, { chatId: options.chat });
     if (globalFlags.json) {
       writeJson(result);
     } else {
       console.log(`Canceled ${result.canceled} job(s).`);
+    }
+  }, globalFlags.timeoutMs);
+}
+
+// An ISO date, or a duration back from now. Returns unix seconds.
+function parseRepairSince(value, now = Date.now()) {
+  const raw = String(value).trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(raw)) {
+    const ms = Date.parse(raw);
+    if (!Number.isFinite(ms)) {
+      throw new Error(`--since: invalid date ${raw}`);
+    }
+    return Math.floor(ms / 1000);
+  }
+  let ms;
+  try {
+    // A bare number would read as seconds; nobody means that here.
+    ms = /^\d+$/.test(raw) ? null : parseDuration(raw);
+  } catch {
+    ms = null;
+  }
+  if (ms === null) {
+    throw new Error(`--since must be an ISO date or a duration such as 7d, got ${raw}`);
+  }
+  return Math.floor((now - ms) / 1000);
+}
+
+// A dry run counts in added_count what it would have added.
+function addedWord(repair) {
+  return repair.dry_run ? 'missing' : 'added';
+}
+
+function repairLabel(repair) {
+  return repair.peer_title || repair.channel_id;
+}
+
+const REPAIR_STATUS_ORDER = ['idle', 'in_progress', 'pending', 'skipped', 'error'];
+const REPAIR_STATUS_LINES = 10;
+const DOCTOR_CHAT_LINES = 10;
+
+function summarizeRepairs(repairs) {
+  const byStatus = {};
+  let checked = 0;
+  let added = 0;
+  let missing = 0;
+  for (const repair of repairs) {
+    byStatus[repair.status] = (byStatus[repair.status] ?? 0) + 1;
+    checked += repair.checked_count ?? 0;
+    if (repair.dry_run) {
+      missing += repair.added_count ?? 0;
+    } else {
+      added += repair.added_count ?? 0;
+    }
+  }
+  return { chats: repairs.length, byStatus, checked, added, missing };
+}
+
+function repairSummary(repair) {
+  return {
+    channelId: repair.channel_id,
+    title: repair.peer_title ?? null,
+    status: repair.status,
+    checked: repair.checked_count ?? 0,
+    added: repair.dry_run ? 0 : repair.added_count ?? 0,
+    missing: repair.dry_run ? repair.added_count ?? 0 : null,
+    dryRun: Boolean(repair.dry_run),
+    cursorMessageId: repair.cursor_message_id ?? null,
+    error: repair.error ?? null,
+  };
+}
+
+// Queue a repair on the always-on server (auto-starting it) and follow it, or return
+// at once with --background. Like `backfill --chat`, Ctrl-C detaches and the server
+// carries on.
+async function runBackfillRepair(globalFlags, options = {}) {
+  return runWithTimeout(async () => {
+    if (Boolean(options.chat) === Boolean(options.all)) {
+      throw new Error('Pass either --chat <id|username> or --all');
+    }
+    if (options.afterId !== undefined && !options.chat) {
+      throw new Error('--after-id works with --chat only');
+    }
+    const afterId = options.afterId !== undefined ? Number(options.afterId) : 0;
+    if (!Number.isInteger(afterId) || afterId < 0) {
+      throw new Error('--after-id must be a message id (0 or more)');
+    }
+    const since = options.since ?? (options.afterId !== undefined ? null : DEFAULT_REPAIR_SINCE);
+    const sinceDate = since ? parseRepairSince(since) : null;
+
+    const storeDir = resolveStoreDir();
+    await ensureAutoStartedServer(globalFlags, storeDir);
+    const { channelIds } = await enqueueRepair(storeDir, {
+      chats: options.chat ? [options.chat] : [],
+      all: Boolean(options.all),
+      afterId,
+      sinceDate,
+      dryRun: Boolean(options.dryRun),
+    });
+    const kind = options.dryRun ? 'dry run of a repair' : 'repair';
+
+    if (options.background) {
+      if (globalFlags.json) {
+        writeJson({ ok: true, channelIds });
+      } else {
+        console.log(`Queued a ${kind} of ${channelIds.length} chat(s). Follow it with \`tgcli backfill status\`.`);
+      }
+      return;
+    }
+
+    let detached = false;
+    const onSigint = () => {
+      detached = true;
+      writeProgress(globalFlags, 'Still running in the background — check `tgcli backfill status`');
+      process.exit(0);
+    };
+    process.on('SIGINT', onSigint);
+
+    try {
+      let repairs = [];
+      let lastLine = null;
+      let lastPrintedAt = 0;
+      while (!detached) {
+        repairs = withReadSnapshot(storeDir, (service) => service.listRepairs({ channelIds }));
+        const active = repairs.find((repair) => !TERMINAL_REPAIR_STATUSES.has(repair.status));
+        if (!active) {
+          break;
+        }
+        const finished = repairs.filter((repair) => TERMINAL_REPAIR_STATUSES.has(repair.status)).length;
+        const line = `${active.dry_run ? 'Checking' : 'Repairing'} ${repairLabel(active)}: checked ${active.checked_count}, ${addedWord(active)} ${active.added_count}`
+          + (repairs.length > 1 ? ` (${finished}/${repairs.length} chats done)` : '');
+        if (line !== lastLine && Date.now() - lastPrintedAt >= REPAIR_PROGRESS_INTERVAL_MS) {
+          writeProgress(globalFlags, line);
+          lastLine = line;
+          lastPrintedAt = Date.now();
+        }
+        await delay(1000);
+      }
+
+      const failed = repairs.filter((repair) => repair.status === 'error');
+      if (failed.length) {
+        process.exitCode = 1;
+      }
+      if (globalFlags.json) {
+        writeJson({ ok: failed.length === 0, repairs: repairs.map(repairSummary) });
+        return;
+      }
+      const skipped = repairs.filter((repair) => repair.status === 'skipped');
+      for (const repair of repairs) {
+        if (repair.status === 'error') {
+          console.error(`Repair of ${repairLabel(repair)} failed: ${repair.error ?? 'unknown error'}`);
+        } else if (repair.status === 'skipped') {
+          console.log(`Skipped ${repairLabel(repair)}: ${repair.error ?? 'Telegram refuses to read it'}`);
+        } else if (repair.added_count > 0 || repairs.length === 1) {
+          console.log(`${repairLabel(repair)}: checked ${repair.checked_count}, ${addedWord(repair)} ${repair.added_count}.`);
+        }
+      }
+      const added = repairs.reduce((sum, repair) => sum + (repair.added_count ?? 0), 0);
+      if (repairs.length > 1) {
+        const repaired = repairs.length - failed.length - skipped.length;
+        const skippedNote = skipped.length ? `, skipped ${skipped.length}` : '';
+        const verb = options.dryRun ? 'Checked' : 'Repaired';
+        console.log(`${verb} ${repaired}/${repairs.length} chat(s)${skippedNote}, ${options.dryRun ? 'missing' : 'added'} ${added} message(s).`);
+      }
+      if (options.dryRun) {
+        console.log('Dry run: nothing written. Run it again without --dry-run to add them.');
+      }
+    } finally {
+      process.off('SIGINT', onSigint);
     }
   }, globalFlags.timeoutMs);
 }
@@ -1776,6 +2039,15 @@ async function runSync(globalFlags, options = {}) {
   }
   // `--once` is a deprecated alias of `backfill wait`: drain quietly and exit.
   return runBackfillWait(globalFlags);
+}
+
+async function runServerStats(globalFlags) {
+  const stats = await fetchServerStats(resolveStoreDir());
+  if (globalFlags.json) {
+    writeJson(stats);
+    return;
+  }
+  console.log(formatServerStats(stats));
 }
 
 async function runServer(globalFlags, options = {}) {
@@ -1804,30 +2076,56 @@ async function runServer(globalFlags, options = {}) {
     if (Number.isFinite(idleExitMs) && idleExitMs > 0) {
       childArgs.push('--idle-exit', String(idleExitMs));
     }
+    if (options.autoStarted) {
+      childArgs.push('--auto-started');
+    }
 
+    // This process writes the server's log, so the log also has what the server
+    // prints before it could log anything itself (a module that fails to load)
+    // and how it ended (a signal). The output still goes where it went before:
+    // the terminal, a service manager's log, or nowhere for an auto-started one.
+    const log = openServerLog(storeDir);
     child = spawn(process.execPath, childArgs, {
-      stdio: 'inherit',
-      env: process.env,
+      stdio: ['inherit', 'pipe', 'pipe'],
+      env: { ...process.env, TGCLI_SERVER_LOG: 'wrapper' },
     });
+    for (const [source, from, to] of [['stdout', child.stdout, process.stdout], ['stderr', child.stderr, process.stderr]]) {
+      to.on('error', () => {});
+      from.on('data', (chunk) => {
+        log.write(chunk, source);
+        to.write(chunk);
+      });
+    }
 
     child.on('error', (error) => {
       cleanup();
+      log.close();
       reject(error);
     });
 
-    child.on('exit', (code, signal) => {
+    // 'close' comes after the child's output has all been read.
+    child.on('close', (code, signal) => {
       cleanup();
       if (code === 0 || signal === 'SIGINT' || signal === 'SIGTERM') {
+        log.close();
         resolve();
         return;
       }
-      reject(new Error(`Server exited with code ${code ?? 'null'}${signal ? ` (${signal})` : ''}`));
+      const message = `Server exited with code ${code ?? 'null'}${signal ? ` (${signal})` : ''}`;
+      log.write(`[server] ${message}\n`, 'server');
+      log.close();
+      reject(new Error(message));
     });
   });
 
-  const { missing } = getStoreConfig(resolveStoreDir());
+  const storeDir = resolveStoreDir();
+  const { missing } = getStoreConfig(storeDir);
   if (missing.length > 0) {
-    throw new Error('Not authenticated. Run "tgcli auth" to configure credentials.');
+    const message = 'Not authenticated. Run "tgcli auth" to configure credentials.';
+    if (options.autoStarted) {
+      appendServerLog(storeDir, `[startup] ${message}`);
+    }
+    throw new Error(message);
   }
 
   return runWithTimeout(runChild, timeoutMs, () => {
@@ -1835,6 +2133,125 @@ async function runServer(globalFlags, options = {}) {
       child.kill('SIGTERM');
     }
   });
+}
+
+function serverLabel(server) {
+  return `tgcli server ${server.version ?? '(unknown version)'} (pid ${server.pid})`;
+}
+
+function reportStopping(globalFlags) {
+  return (server) => writeProgress(globalFlags, `Stopping ${serverLabel(server)}...`);
+}
+
+function notStoppedError(server, force) {
+  return new Error(force
+    ? `${serverLabel(server)} could not be killed.`
+    : `${serverLabel(server)} has not exited a minute after it was asked to stop; \`tgcli server stop --force\` kills it.`);
+}
+
+function stoppedServerPayload(server) {
+  return {
+    pid: server.pid,
+    version: server.version,
+    autoStarted: server.autoStarted,
+    manager: server.manager,
+    method: server.method,
+  };
+}
+
+async function runServerStop(globalFlags, options = {}) {
+  return runWithTimeout(async () => {
+    const force = Boolean(options.force);
+    const result = await stopServer(resolveStoreDir(), { force, onStopping: reportStopping(globalFlags) });
+    if (result.running && !result.stopped) {
+      throw notStoppedError(result, force);
+    }
+    if (globalFlags.json) {
+      writeJson({ running: result.running, stopped: result.stopped, server: result.running ? stoppedServerPayload(result) : null });
+      return;
+    }
+    if (!result.running) {
+      console.log('No tgcli server is running.');
+      return;
+    }
+    console.log(`Stopped ${serverLabel(result)}.`);
+    if (isManagedServer(result)) {
+      console.log(`${result.manager} runs it as a service and may start it again; \`tgcli service stop\` keeps it stopped.`);
+    }
+  }, globalFlags.timeoutMs);
+}
+
+async function runServerRestart(globalFlags, options = {}) {
+  return runWithTimeout(async () => {
+    const storeDir = resolveStoreDir();
+    if (getStoreConfig(storeDir).missing.length > 0) {
+      throw new Error('Not authenticated. Run "tgcli auth" to configure credentials.');
+    }
+    const force = Boolean(options.force);
+    const { previous, current } = await restartServer(storeDir, {
+      force,
+      quiet: globalFlags.quiet,
+      onStopping: reportStopping(globalFlags),
+    });
+    if (previous.running && !previous.stopped) {
+      throw notStoppedError(previous, force);
+    }
+    if (!current) {
+      throw new Error(`Stopped ${serverLabel(previous)}, but ${previous.manager} has not started it again; \`tgcli service start\` does.`);
+    }
+    const currentPayload = { pid: current.pid, version: current.version ?? null, startedAt: current.startedAt ?? null };
+    if (globalFlags.json) {
+      writeJson({ previous: previous.running ? stoppedServerPayload(previous) : null, current: currentPayload });
+      return;
+    }
+    console.log(previous.running
+      ? `Restarted tgcli server: ${previous.version ?? '(unknown version)'} (pid ${previous.pid}) -> ${current.version} (pid ${current.pid}).`
+      : `Started ${serverLabel(current)}.`);
+    if (current.version !== readVersion()) {
+      console.log(`It runs ${current.version}, not this CLI's ${readVersion()}: ${isManagedServer(previous) ? `${previous.manager} started it` : 'another CLI started it first'}.`);
+    }
+  }, globalFlags.timeoutMs);
+}
+
+async function runServerLogs(globalFlags, options = {}) {
+  const count = parsePositiveInt(options.lines, '--lines') ?? DEFAULT_SERVER_LOG_LINES;
+  const storeDir = resolveStoreDir();
+  const tail = readServerLogTail(storeDir, count);
+  if (globalFlags.json && !options.follow) {
+    writeJson({ path: tail.path, exists: tail.exists, lines: tail.lines });
+    return;
+  }
+  // With --follow, --json prints one JSON object per line as it arrives.
+  const emit = globalFlags.json
+    ? (line) => process.stdout.write(`${JSON.stringify({ line })}\n`)
+    : (line) => process.stdout.write(`${line}\n`);
+  if (!tail.exists) {
+    if (!options.follow) {
+      console.log(`No server log yet (${tail.path}).`);
+      return;
+    }
+    writeProgress(globalFlags, `Waiting for ${tail.path}...`);
+  }
+  tail.lines.forEach(emit);
+  if (!options.follow) {
+    return;
+  }
+
+  const controller = new AbortController();
+  const stop = () => controller.abort();
+  process.once('SIGINT', stop);
+  const timer = globalFlags.timeoutMs ? setTimeout(stop, globalFlags.timeoutMs) : null;
+  try {
+    await followServerLog(storeDir, (lines) => lines.forEach(emit), {
+      signal: controller.signal,
+      from: tail.position ?? undefined,
+    });
+  } finally {
+    process.off('SIGINT', stop);
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 async function runServiceInstall(globalFlags) {
@@ -2170,10 +2587,12 @@ async function runSyncStatus(globalFlags) {
     const storeDir = resolveStoreDir();
     // Snapshot the queue + active backfills under a brief read lock so a running
     // server keeps its write lock free.
-    const { queue, jobs } = withReadSnapshot(storeDir, (service) => ({
+    const { queue, jobs, repairs } = withReadSnapshot(storeDir, (service) => ({
       queue: service.getQueueStats(),
       jobs: service.listJobs({ limit: 100 }),
+      repairs: service.listRepairs(),
     }));
+    const repairTotals = summarizeRepairs(repairs);
     // in_progress first, then pending — the chats actively/imminently backfilling.
     const active = jobs.filter((job) => job.status === 'in_progress' || job.status === 'pending');
     const ping = await pingServer(storeDir);
@@ -2192,11 +2611,13 @@ async function runSyncStatus(globalFlags) {
           cursorDate: job.cursor_message_date ?? null,
           updatedAt: job.updated_at ?? null,
         })),
+        repairTotals,
+        repairs: repairs.map(repairSummary),
       });
       return;
     }
 
-    console.log(`QUEUE: pending=${queue.pending} in_progress=${queue.in_progress} idle=${queue.idle} error=${queue.error}`);
+    console.log(`QUEUE: pending=${queue.pending} in_progress=${queue.in_progress} idle=${queue.idle} error=${queue.error} gaps=${queue.gaps}`);
     console.log(`SERVER: ${ping ? `up (pid ${ping.pid})` : 'down'}`);
     if (active.length === 0) {
       console.log('No active backfills.');
@@ -2209,6 +2630,23 @@ async function runSyncStatus(globalFlags) {
         const cursor = job.cursor_message_date ? ` cursor=${job.cursor_message_date}` : '';
         const updated = job.updated_at ? ` updated=${job.updated_at}` : '';
         console.log(`  ${label} [${job.status}] ${done}/${target} (${pct}%)${cursor}${updated}`);
+      }
+    }
+    if (repairs.length) {
+      // `--all` queues every synced chat, so name only the one under way and the failures.
+      const counts = REPAIR_STATUS_ORDER.map((status) => `${status}=${repairTotals.byStatus[status] ?? 0}`).join(' ');
+      const missing = repairs.some((repair) => repair.dry_run) ? ` missing=${repairTotals.missing}` : '';
+      console.log(`REPAIRS: ${repairTotals.chats} chat(s) ${counts} checked=${repairTotals.checked} added=${repairTotals.added}${missing}`);
+      const named = [
+        ...repairs.filter((repair) => repair.status === 'in_progress'),
+        ...repairs.filter((repair) => repair.status === 'error'),
+      ];
+      for (const repair of named.slice(0, REPAIR_STATUS_LINES)) {
+        const error = repair.error ? ` error=${repair.error}` : '';
+        console.log(`  repair ${repairLabel(repair)} [${repair.status}] checked=${repair.checked_count} ${addedWord(repair)}=${repair.added_count}${error}`);
+      }
+      if (named.length > REPAIR_STATUS_LINES) {
+        console.log(`  … and ${named.length - REPAIR_STATUS_LINES} more; \`tgcli --json backfill status\` lists them all.`);
       }
     }
   }, timeoutMs);
@@ -2287,7 +2725,7 @@ async function runSyncJobsAdd(globalFlags, options = {}) {
   return runWithTimeout(async () => {
     const storeDir = resolveStoreDir();
     const depth = parsePositiveInt(options.depth, '--depth');
-    await ensureServer(storeDir, { idleExit: '60s' });
+    await ensureAutoStartedServer(globalFlags, storeDir);
     const job = await enqueueBackfill(storeDir, {
       chatId: options.chat,
       depth,
@@ -2315,7 +2753,7 @@ async function runSyncJobsRetry(globalFlags, options = {}) {
   }
   return runWithTimeout(async () => {
     const storeDir = resolveStoreDir();
-    await ensureServer(storeDir, { idleExit: '60s' });
+    await ensureAutoStartedServer(globalFlags, storeDir);
     const result = await retryBackfill(storeDir, { jobId, channelId, allErrors });
     if (globalFlags.json) {
       writeJson(result);
@@ -2336,7 +2774,7 @@ async function runSyncJobsCancel(globalFlags, options = {}) {
   }
   return runWithTimeout(async () => {
     const storeDir = resolveStoreDir();
-    await ensureServer(storeDir, { idleExit: '60s' });
+    await ensureAutoStartedServer(globalFlags, storeDir);
     const result = await cancelBackfill(storeDir, {
       jobId,
       chatId: channelId,
@@ -2347,6 +2785,27 @@ async function runSyncJobsCancel(globalFlags, options = {}) {
       console.log(`Canceled ${result.canceled} job(s).`);
     }
   }, globalFlags.timeoutMs);
+}
+
+// Chats that older versions stored under a username, and what becomes of each.
+function formatUsernameKeyLines(chats) {
+  if (!chats.length) {
+    return [];
+  }
+  const lines = [`USERNAME KEYS: ${chats.length} chat(s) stored under a username instead of a Telegram id. The server moves each to its id after it logs in to Telegram; messages already under the id stay, duplicates are dropped.`];
+  for (const chat of chats) {
+    const messages = `${chat.messages} message(s)`;
+    if (chat.lastCheck) {
+      const { outcome, detail, checkedAt } = chat.lastCheck;
+      const next = outcome === 'failed' ? 'tried again when the server next starts' : 'asked again a day after that';
+      lines.push(`  ${chat.key}: ${messages}, stays as it is: ${detail} (${checkedAt}); ${next}.`);
+    } else if (chat.archivedAs) {
+      lines.push(`  ${chat.key}: ${messages}, to be merged with its Telegram id; the archive also has ${chat.archivedAs} under this username.`);
+    } else {
+      lines.push(`  ${chat.key}: ${messages}, no Telegram id known for it yet; the server asks Telegram for one.`);
+    }
+  }
+  return lines;
 }
 
 async function runDoctor(globalFlags, options = {}) {
@@ -2366,6 +2825,19 @@ async function runDoctor(globalFlags, options = {}) {
 
     const search = messageSyncService.getSearchStatus();
     const queue = messageSyncService.getQueueStats();
+    const repairSuggested = messageSyncService.isRepairSuggested();
+    const leftChats = messageSyncService.getLeftChatCounts();
+    const unansweredChats = messageSyncService.listUnansweredChats().map((chat) => ({
+      channelId: chat.channel_id,
+      title: chat.peer_title ?? null,
+      checkedAt: chat.membership_checked_at ? new Date(chat.membership_checked_at).toISOString() : null,
+    }));
+    const usernameKeys = messageSyncService.listUsernameKeyedChats();
+    const update = getUpdateStatus({
+      storeDir,
+      version: readVersion(),
+      installMethod: detectInstallMethod(),
+    });
 
     const payload = {
       storeDir,
@@ -2376,6 +2848,11 @@ async function runDoctor(globalFlags, options = {}) {
       ftsEnabled: search.enabled,
       ftsVersion: search.version,
       queue,
+      repairSuggested,
+      leftChats,
+      unansweredChats,
+      usernameKeys,
+      update,
     };
 
     if (globalFlags.json) {
@@ -2388,7 +2865,29 @@ async function runDoctor(globalFlags, options = {}) {
     console.log(`AUTHENTICATED: ${payload.authenticated}`);
     console.log(`CONNECTED: ${payload.connected}`);
     console.log(`FTS: ${payload.ftsEnabled}${payload.ftsVersion ? ` (v${payload.ftsVersion})` : ''}`);
-    console.log(`QUEUE: pending=${queue.pending} in_progress=${queue.in_progress} idle=${queue.idle} error=${queue.error}`);
+    console.log(`QUEUE: pending=${queue.pending} in_progress=${queue.in_progress} idle=${queue.idle} error=${queue.error} gaps=${queue.gaps}`);
+    if (leftChats.syncOff) {
+      console.log(`LEFT: sync is off for ${leftChats.syncOff} chat(s) you are not in (left, removed or never joined); it comes back on if you rejoin, or for good with \`tgcli channels watch --chat <id>\`.`);
+    }
+    if (leftChats.stillJoined) {
+      console.log(`DIALOGS: ${leftChats.stillJoined} synced chat(s) are missing from your dialog list, though Telegram says you are still in them; sync stays on.`);
+    }
+    if (unansweredChats.length) {
+      console.log(`UNANSWERED: ${unansweredChats.length} synced chat(s) are missing from your dialog list, and Telegram gives no answer about them (most often a private chat you were removed from), so nothing arrives from them. Turn their sync off with \`tgcli channels unwatch --missing\`.`);
+      for (const chat of unansweredChats.slice(0, DOCTOR_CHAT_LINES)) {
+        console.log(`  ${chat.channelId}${chat.title ? ` ${chat.title}` : ''}`);
+      }
+      if (unansweredChats.length > DOCTOR_CHAT_LINES) {
+        console.log(`  … and ${unansweredChats.length - DOCTOR_CHAT_LINES} more; \`tgcli --json doctor\` lists them all.`);
+      }
+    }
+    if (repairSuggested) {
+      console.log(`REPAIR: versions before 2.2.5 could lose messages; fill the holes with \`tgcli backfill repair --all\` (the last ${DEFAULT_REPAIR_SINCE} of every synced chat).`);
+    }
+    for (const line of formatUsernameKeyLines(usernameKeys)) {
+      console.log(line);
+    }
+    console.log(formatDoctorUpdateLine(update));
   });
 }
 
@@ -2421,6 +2920,20 @@ async function runChannelsShow(globalFlags, options = {}) {
     writeJson(channel);
   } else {
     console.log(JSON.stringify(channel, null, 2));
+  }
+}
+
+async function runChannelsUnwatchMissing(globalFlags, options = {}) {
+  if (options.chat) {
+    throw new Error('Use either --chat or --missing');
+  }
+  const { channelIds } = await runOperation(globalFlags, { op: 'channelsUnwatchMissing', args: {} });
+  if (globalFlags.json) {
+    writeJson({ ok: true, channelIds });
+  } else if (channelIds.length) {
+    console.log(`Sync disabled for ${channelIds.length} chat(s): ${channelIds.join(', ')}.`);
+  } else {
+    console.log('No chat is missing from your dialogs without an answer from Telegram.');
   }
 }
 
@@ -2693,7 +3206,21 @@ function buildSendPhotoSuccessPayload({ method, inputChatId, result, attempts })
     media: result?.media ?? { type: 'photo' },
     attempts,
     warning: result?.warning,
+    scheduled: result?.scheduled,
   });
+}
+
+// The label comes from the server's result, not from --schedule: a server on an
+// older version may have ignored the flag and sent the message right away.
+function sendOutcome(result) {
+  return result?.scheduled ? 'scheduled' : 'sent';
+}
+
+function printSendOutcome(label, result) {
+  console.log(`${label} ${sendOutcome(result)} (${result.messageId}).`);
+  if (result.warning) {
+    console.error(`Warning: ${result.warning}`);
+  }
 }
 
 // Map a client-side invoke timeout (AbortSignal.timeout fires a TimeoutError, an
@@ -2754,7 +3281,7 @@ async function runSendText(globalFlags, options = {}) {
     if (globalFlags.json) {
       writeJson(payload);
     } else {
-      console.log(`Message sent (${result.messageId}).`);
+      printSendOutcome('Message', result);
     }
   } catch (error) {
     throw normalizeSendCommandError(error, { method, retries });
@@ -2792,7 +3319,7 @@ async function runSendPhoto(globalFlags, options = {}) {
     if (globalFlags.json) {
       writeJson(buildSendPhotoSuccessPayload({ method, inputChatId: options.to, result, attempts }));
     } else {
-      console.log(`Photo sent (${result.messageId}).`);
+      printSendOutcome('Photo', result);
     }
   } catch (error) {
     throw normalizeSendCommandError(error, { method, retries });
@@ -2836,7 +3363,7 @@ async function runSendFile(globalFlags, options = {}) {
     if (globalFlags.json) {
       writeJson(payload);
     } else {
-      console.log(`File sent (${result.messageId}).`);
+      printSendOutcome('File', result);
     }
   } catch (error) {
     throw normalizeSendCommandError(error, { method, retries });
@@ -3493,13 +4020,65 @@ function shouldRunMain(entryPath = process.argv[1]) {
   }
 }
 
+// `server` runs unattended with its output in a log, so it neither checks nor
+// prints; `doctor` checks but prints its own UPDATE line instead of the notice.
+const UPDATE_CHECK_SKIPPED_COMMANDS = new Set(['server']);
+const UPDATE_NOTICE_SKIPPED_COMMANDS = new Set(['server', 'doctor']);
+
+function commandPath(command) {
+  const names = [];
+  for (let current = command; current?.parent; current = current.parent) {
+    names.unshift(current.name());
+  }
+  return names.join(' ');
+}
+
+// Hook the new-version notice into a program: before the action, start the daily
+// background registry check if it is due; after a successful action, print the
+// cached notice.
+function installUpdateNotice(program, deps = {}) {
+  const {
+    version = readVersion(),
+    installMethod = detectInstallMethod(),
+    env = process.env,
+    stderr = process.stderr,
+    now = () => Date.now(),
+    spawnFn,
+  } = deps;
+  const enabled = () => !getUpdateCheckDisabledReason({ env, version, installMethod });
+  program.hook('preAction', (_program, actionCommand) => {
+    if (UPDATE_CHECK_SKIPPED_COMMANDS.has(commandPath(actionCommand)) || !enabled()) return;
+    scheduleUpdateCheck({ storeDir: resolveStoreDir(), now: now(), spawnFn });
+  });
+  program.hook('postAction', (_program, actionCommand) => {
+    if (UPDATE_NOTICE_SKIPPED_COMMANDS.has(commandPath(actionCommand)) || !enabled()) return;
+    // A failed command ends on its error; the notice waits for the next run.
+    if (process.exitCode) return;
+    const options = actionCommand.optsWithGlobals();
+    maybePrintUpdateNotice({
+      storeDir: resolveStoreDir(),
+      version,
+      installMethod,
+      json: Boolean(options.json),
+      quiet: Boolean(options.quiet),
+      env,
+      stderr,
+      now: now(),
+    });
+  });
+  return program;
+}
+
 async function main() {
+  installUpdateNotice(CLI_PROGRAM);
   await CLI_PROGRAM.parseAsync(process.argv);
 }
 
 export {
   buildProgram,
+  installUpdateNotice,
   buildSendPhotoSuccessPayload,
+  printSendOutcome,
   DEFAULT_SEND_TIMEOUT_MS,
   formatFeedbackMessage,
   formatSendTimeoutMessage,
